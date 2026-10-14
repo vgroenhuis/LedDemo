@@ -60,3 +60,7 @@ For time-critical parts call `closer_demo_roaming_hold(true)` ... `closer_demo_r
 ## LED page
 `/ws` (WebSocket) takes "rrggbb,brightness" text frames; the page uses it for every slider step and falls back to
 `POST /api/led` if the socket is down. The colour is saved to flash 1.5 s after the last change (a flash write stalls the web server).
+
+## License
+
+MIT, see [LICENSE](LICENSE). The ESP-IDF framework and the `led_strip` component it downloads are Apache-2.0.
