@@ -1,0 +1,11 @@
+menu "Turtle demo"
+    config TURTLE_LED_GPIO
+        int "GPIO of the on-board RGB LED"
+        default 27
+        help
+            ESP32-C5-DevKitC-1: the addressable RGB LED (WS2812) sits on GPIO27.
+    config TURTLE_BRIGHTNESS
+        int "Default brightness in percent"
+        default 25
+        range 1 100
+endmenu

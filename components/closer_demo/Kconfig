@@ -1,0 +1,50 @@
+menu "CloSer demo reporting"
+    config CLOSER_REPORT_URL
+        string "Lab demos page (no trailing slash)"
+        default "https://closer.ram.eemcs.utwente.nl/labdemos"
+    config CLOSER_INTERVAL_S
+        int "Seconds between reports"
+        default 60
+        range 10 3600
+    config CLOSER_DEFAULT_SSID
+        string "Wi-Fi network if none is stored in flash"
+        default ""
+    config CLOSER_DEFAULT_PASSWORD
+        string "Wi-Fi password if none is stored in flash"
+        default ""
+    config CLOSER_DEFAULT_KEY
+        string "Device key if none is stored in flash"
+        default ""
+    config CLOSER_ROAMING
+        bool "Move to a clearly stronger access point of the same network"
+        default y
+    config CLOSER_ROAM_RSSI
+        int "Look for a better access point when the signal is weaker than (dBm)"
+        default -67
+    config CLOSER_ROAM_MARGIN
+        int "Switch only if the other access point is stronger by at least (dB)"
+        default 10
+    config CLOSER_ROAM_CHECK_S
+        int "Seconds between signal checks"
+        default 20
+    config CLOSER_ROAM_INITIAL_SCAN
+        bool "Look around once shortly after connecting"
+        default y
+    config CLOSER_ROAM_PERIODIC_S
+        int "Look around this often even when the signal is fine (seconds, 0 = never)"
+        default 0
+    config CLOSER_ROAM_BACKOFF_MAX_S
+        int "While the signal is weak but nothing better exists, look around less and less often, up to every (seconds)"
+        default 600
+    config CLOSER_ROAM_SCAN_CHANNEL_MS
+        int "Listening time per channel during a scan (ms)"
+        default 40
+    config CLOSER_ROAM_SCAN_DWELL_MS
+        int "Time back on the network's own channel between two scanned channels (ms)"
+        default 100
+        range 0 255
+        help
+            A scan visits ~40 channels (2.4 and 5 GHz). Between channels the radio returns to the network's
+            channel for this long, so traffic is held up for tens of milliseconds at a time instead of seconds.
+            The whole scan then takes a few seconds, in which the connection works but with some extra delay.
+endmenu
