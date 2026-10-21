@@ -15,6 +15,16 @@ menu "CloSer demo reporting"
     config CLOSER_DEFAULT_KEY
         string "Device key if none is stored in flash"
         default ""
+    choice CLOSER_WIFI_BAND
+        prompt "Wi-Fi band"
+        default CLOSER_WIFI_BAND_AUTO
+        config CLOSER_WIFI_BAND_AUTO
+            bool "2.4 and 5 GHz"
+        config CLOSER_WIFI_BAND_5G
+            bool "5 GHz only"
+        config CLOSER_WIFI_BAND_2G
+            bool "2.4 GHz only"
+    endchoice
     config CLOSER_ROAMING
         bool "Move to a clearly stronger access point of the same network"
         default y

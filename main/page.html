@@ -14,12 +14,45 @@ label{display:block;margin:14px 0 4px;color:var(--muted);font-size:.9rem}input[t
 .presets button{height:40px;border-radius:8px;border:1px solid var(--line);cursor:pointer}
 .off{width:100%;margin-top:12px;padding:9px;border-radius:8px;border:1px solid var(--line);background:none;color:var(--fg);font:inherit;cursor:pointer}
 small{display:block;margin-top:14px;color:var(--muted)}
+.modes{display:grid;grid-template-columns:1fr 1fr;gap:0;margin-bottom:14px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.modes button{padding:9px;border:0;background:none;color:var(--fg);font:inherit;cursor:pointer}
+.modes button.on{background:var(--accent);color:#fff}
+.hide{display:none}
+dl{display:grid;grid-template-columns:auto 1fr;gap:3px 14px;margin:0;font-size:.95rem}dt{color:var(--muted)}dd{margin:0;font-variant-numeric:tabular-nums}
+.bar{height:8px;border-radius:4px;background:var(--line);margin:10px 0 14px;overflow:hidden}.bar i{display:block;height:100%;width:0;transition:width .4s,background .4s}
+table{width:100%;border-collapse:collapse;font-size:.88rem;margin-top:14px}td{padding:3px 4px;vertical-align:middle;border-top:1px solid var(--line)}
+td:first-child{width:26px}.lamp{display:inline-block;width:14px;height:14px;border-radius:50%;border:1px solid var(--line)}
+@keyframes blink{50%{opacity:0}}@keyframes breathe{0%,100%{opacity:.1}50%{opacity:1}}
+@keyframes dbl{0%,6%{opacity:1}6.1%,15%{opacity:.2}15.1%,21%{opacity:1}21.1%,100%{opacity:.2}}@keyframes flash{0%,10%{opacity:1}10.1%,100%{opacity:.2}}
 </style></head><body><main>
-<h1>Turtle</h1><p>Set the colour of the on-board LED.</p>
+<h1>Turtle</h1><p>Set the colour of the on-board LED, or let it show the Wi-Fi signal.</p>
 <div class="card">
+<div class="modes"><button id="mFixed">Fixed colour</button><button id="mWifi">Wi-Fi signal</button></div>
 <div id="sw"></div>
+<div id="fixed">
 <input id="col" type="color" value="#00a0ff" aria-label="Colour">
 <div class="presets" id="pre"></div>
+</div>
+<div id="wifi" class="hide">
+<div class="bar"><i id="qbar"></i></div>
+<dl>
+<dt>State</dt><dd id="wState">…</dd>
+<dt>Quality</dt><dd id="wQ">–</dd>
+<dt>Signal</dt><dd id="wRssi">–</dd>
+<dt>Ping</dt><dd id="wPing">–</dd>
+<dt>Lost</dt><dd id="wLoss">–</dd>
+<dt>Access point</dt><dd id="wAp">–</dd>
+</dl>
+<table>
+<tr><td><span class="lamp" style="background:linear-gradient(90deg,#f00,#ff0,#0f0)"></span></td><td>Steady: connection quality, green good, yellow fair, red poor. The worst of signal (−60 to −82 dBm), lost pings (0 to 20 %) and ping time (20 to 200 ms) counts. A short dark blip is a lost ping.</td></tr>
+<tr><td><span class="lamp" style="background:#003cff;animation:breathe 2s infinite"></span></td><td>Blue, breathing: looking for the network</td></tr>
+<tr><td><span class="lamp" style="background:#00dcff;animation:blink .25s steps(1) infinite"></span></td><td>Cyan, fast blink: joined, getting an address</td></tr>
+<tr><td><span class="lamp" style="background:#fff;animation:blink .3s steps(1) infinite"></span></td><td>White flicker on the colour: looking for a stronger access point; white fast blink: moving to it</td></tr>
+<tr><td><span class="lamp" style="background:#ff6e00;animation:blink .5s steps(1) infinite"></span></td><td>Orange blink: connection lost, reconnecting</td></tr>
+<tr><td><span class="lamp" style="background:#f00;animation:flash 1.5s infinite"></span></td><td>Red flash every 1.5 s: no connection for over 30 s</td></tr>
+<tr><td><span class="lamp" style="background:#c800ff;animation:dbl 2s infinite"></span></td><td>Purple double flash: the network refused the password</td></tr>
+</table>
+</div>
 <label for="br">Brightness <span id="bv"></span></label>
 <input id="br" type="range" min="1" max="100" value="25">
 <button class="off" id="off">Turn off</button>
@@ -31,18 +64,40 @@ const $=id=>document.getElementById(id);let t;
 const show=(hex,br)=>{$('sw').style.background=hex;$('bv').textContent=br+' %';};
 // One WebSocket carries every step of the slider; without it (or while it reconnects) fall back to plain requests.
 let ws=null,pending=null,raf=0,postT;
-function connect(){try{ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+function connect(){try{ws=new WebSocket(new URL('ws',location.href).href.replace(/^http/,'ws'));
   ws.onclose=ws.onerror=()=>{ws=null;setTimeout(connect,1500);};}catch(e){ws=null;}}
 connect();
 function flush(){raf=0;const m=pending;pending=null;if(m===null)return;
   if(ws&&ws.readyState===1)ws.send(m);
-  else{clearTimeout(postT);postT=setTimeout(()=>{const[h,b]=m.split(',');fetch('/api/led?hex='+h+'&brightness='+b,{method:'POST'}).catch(()=>{});},60);}}
+  else{clearTimeout(postT);postT=setTimeout(()=>{const[h,b]=m.split(',');fetch('api/led?hex='+h+'&brightness='+b,{method:'POST'}).catch(()=>{});},60);}}
+let mode='fixed',wT=0;
 function send(){const hex=$('col').value.slice(1),br=$('br').value;show('#'+hex,br);
+  if(mode!=='fixed')setMode('fixed',false);
   pending=hex+','+br;if(!raf)raf=requestAnimationFrame(flush);}
-$('col').oninput=send;$('br').oninput=send;
-$('off').onclick=()=>{pending='000000,'+$('br').value;flush();show('#000000',$('br').value);$('sw').style.background='var(--bg)';};
+$('col').oninput=send;
+$('br').oninput=()=>{if(mode==='wifi'){$('bv').textContent=$('br').value+' %';pending=','+$('br').value;if(!raf)raf=requestAnimationFrame(flush);}else send();};
+$('off').onclick=()=>{setMode('fixed',false);pending='000000,'+$('br').value;flush();show('#000000',$('br').value);$('sw').style.background='var(--bg)';};
+function setMode(m,tell){mode=m;$('mFixed').classList.toggle('on',m==='fixed');$('mWifi').classList.toggle('on',m==='wifi');
+  $('fixed').classList.toggle('hide',m!=='fixed');$('wifi').classList.toggle('hide',m!=='wifi');$('off').classList.toggle('hide',m!=='fixed');
+  if(tell){pending='mode='+m;flush();}
+  clearTimeout(wT);if(m==='wifi')poll();else{const hex=$('col').value;show(hex,$('br').value);}}
+$('mFixed').onclick=()=>{setMode('fixed',true);};$('mWifi').onclick=()=>setMode('wifi',true);
+const PH={starting:'Starting',searching:'Looking for the network',getting_ip:'Getting an address',connected:'Connected',
+  scanning:'Looking for a stronger access point',roaming:'Moving to a stronger access point',reconnecting:'Reconnecting',
+  offline:'No connection (over 30 s)',auth_failed:'Password refused'};
+function poll(){fetch('api/wifi',{cache:'no-store'}).then(r=>r.json()).then(w=>{
+  $('sw').style.background='#'+w.led;
+  $('wState').textContent=(PH[w.phase]||w.phase)+(w.text&&w.phase!=='connected'?' · '+w.text:'');
+  const q=w.quality;$('wQ').textContent=q==null?'–':q+' %';
+  $('qbar').style.width=(q==null?0:Math.max(q,3))+'%';$('qbar').style.background=q==null?'none':`hsl(${1.2*q},90%,48%)`;
+  $('wRssi').textContent=w.rssi?w.rssi+' dBm':'–';
+  $('wPing').textContent=w.rtt==null?(w.target==='none'?'no replies (router and server)':'–'):w.rtt+' ms to the '+w.target+' ('+w.target_ip+')';
+  $('wLoss').textContent=w.loss==null?'–':w.loss+' % of the last 20';
+  $('wAp').textContent=w.bssid?w.bssid+' · ch '+w.channel+(w.ssid?' · '+w.ssid:''):'–';
+}).catch(()=>{$('wState').textContent='The page lost the board';}).finally(()=>{if(mode==='wifi')wT=setTimeout(poll,1000);});}
 ['#ff3030','#ff9000','#ffe000','#30d060','#2090ff','#a050ff'].forEach(c=>{const b=document.createElement('button');b.style.background=c;
   b.onclick=()=>{$('col').value=c;send();};$('pre').appendChild(b);});
-fetch('/api/led').then(r=>r.json()).then(s=>{const hex='#'+s.hex;$('col').value=hex==='#000000'?'#00a0ff':hex;$('br').value=s.brightness;
-  show(hex==='#000000'?'var(--bg)':hex,s.brightness);$('info').textContent='Firmware '+s.fw+' · '+s.host;}).catch(()=>{});
+setMode('fixed',false);
+fetch('api/led').then(r=>r.json()).then(s=>{const hex='#'+s.hex;$('col').value=hex==='#000000'?'#00a0ff':hex;$('br').value=s.brightness;
+  show(hex==='#000000'?'var(--bg)':hex,s.brightness);if(s.mode==='wifi')setMode('wifi',false);$('info').textContent='Firmware '+s.fw+' · '+s.host;}).catch(()=>{});
 </script></body></html>

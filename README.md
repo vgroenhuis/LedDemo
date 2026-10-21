@@ -40,7 +40,7 @@ different version is published. A crash loop before confirmation also rolls back
 Roll back by publishing an older build. `unpublish turtle` stops offering updates.
 
 ## Not done yet
-* Firmware signing: the integrity check is the SHA-256 from the server over HTTPS, so whoever controls the server controls the devices.
+* Firmware signing (deliberately not done, lab demos are low risk): the integrity check is the SHA-256 from the server over HTTPS, so whoever controls the server controls the devices.
   Next step: signed app images (CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT) with the key kept off the web path.
 * Remote testing of a release before it goes out (run it on a spare board, or a simulator, and publish when it passes).
 
@@ -60,6 +60,29 @@ For time-critical parts call `closer_demo_roaming_hold(true)` ... `closer_demo_r
 ## LED page
 `/ws` (WebSocket) takes "rrggbb,brightness" text frames; the page uses it for every slider step and falls back to
 `POST /api/led` if the socket is down. The colour is saved to flash 1.5 s after the last change (a flash write stalls the web server).
+
+## Wi-Fi signal mode (since 1.5.0)
+The page switches the LED between a fixed colour and a Wi-Fi signal light (`mode=wifi` / `mode=fixed` over `/ws`,
+or `POST /api/led?mode=wifi`; saved in flash). Twice a second the board reads the signal strength of its access point
+and pings the router (if the router never answers, the lab demos server; if that doesn't either, signal strength only).
+Over the last 20 pings (10 s) it works out lost pings and the mean ping time. Each of the three gives a quality from 1 to 0
+(signal -60 to -82 dBm, loss 0 to 20 %, ping 20 to 200 ms; constants at the top of the Wi-Fi section in main.c);
+the worst one sets the colour, green - yellow - red.
+
+| LED | meaning |
+| --- | --- |
+| steady green / yellow / red | connected; quality. A short dark blip: a lost ping |
+| blue, breathing | looking for the network |
+| cyan, fast blink | joined an access point, getting an address |
+| white flicker on the colour | scanning for a stronger access point (roaming) |
+| white, fast blink | moving to a stronger access point |
+| orange blink | connection lost, reconnecting |
+| red flash every 1.5 s | no connection for more than 30 s |
+| purple double flash | the network refused the password |
+
+`GET /api/wifi` gives the live numbers (the page shows them); the reports to the lab demos page include
+`ping_ms`, `ping_loss_pct` and `wifi_quality_pct`. `closer_demo_get_status()` now also gives the Wi-Fi phase,
+seconds without a connection, the gateway and the access point's BSSID.
 
 ## License
 

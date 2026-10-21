@@ -26,6 +26,37 @@ void closer_demo_set_message(const char *text);              // short note on th
 // the critical part and false after it; a scan that was due then happens later.
 void closer_demo_roaming_hold(bool hold);
 
+// What Wi-Fi is doing, for a status light (closer_demo_status_t.phase).
+typedef enum {
+    CLOSER_WIFI_STARTING,
+    CLOSER_WIFI_SEARCHING,      // looking for the network (not connected since start-up)
+    CLOSER_WIFI_GETTING_IP,     // joined an access point, waiting for an address
+    CLOSER_WIFI_CONNECTED,
+    CLOSER_WIFI_SCANNING,       // connected, scanning for a stronger access point
+    CLOSER_WIFI_ROAMING,        // moving to a stronger access point
+    CLOSER_WIFI_RECONNECTING,   // the connection was lost, trying again
+    CLOSER_WIFI_AUTH_FAILED,    // the access point turned us down: wrong password?
+} closer_wifi_phase_t;
+
+// For a status display.
+typedef struct {
+    bool connected;
+    char ip[16];          // "" while not connected
+    int rssi;             // dBm, 0 when unknown
+    bool updating;        // installing a firmware update right now
+    char note[121];       // the short message shown on the demo page ("update failed ...")
+    char wifi[48];        // what Wi-Fi is doing, e.g. "Searching for iotroam", "Joining iotroam (ch 124)",
+                          // "Getting an address", "Connected", "Wrong password? (try 3)", "Looking for a better AP"
+    char ssid[33];        // the network
+    int channel;          // of the access point, 0 when not associated
+    int attempts;         // connection attempts since the last success
+    closer_wifi_phase_t phase;
+    int down_s;           // seconds without a connection (since start-up or since it was lost); 0 while connected
+    char gateway[16];     // "" while not connected
+    char bssid[18];       // the access point, "aa:bb:cc:dd:ee:ff"; "" while not associated
+} closer_demo_status_t;
+void closer_demo_get_status(closer_demo_status_t *out);
+
 bool closer_demo_wifi_connected(void);
 const char *closer_demo_version(void);                       // the running firmware version
 
