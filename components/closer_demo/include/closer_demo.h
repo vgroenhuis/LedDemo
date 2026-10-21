@@ -10,6 +10,7 @@
 #pragma once
 #include <stdbool.h>
 #include "esp_err.h"
+#include "esp_wifi_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,6 +57,11 @@ typedef struct {
     char bssid[18];       // the access point, "aa:bb:cc:dd:ee:ff"; "" while not associated
 } closer_demo_status_t;
 void closer_demo_get_status(closer_demo_status_t *out);
+
+// A survey: scans all channels for every network (gently, like the roaming scans: traffic is delayed, not dropped)
+// and fills up to *n records, strongest first; *n becomes the number filled. Only while connected.
+// ESP_ERR_INVALID_STATE while not connected or while another scan runs.
+esp_err_t closer_demo_scan_all(wifi_ap_record_t *out, uint16_t *n);
 
 bool closer_demo_wifi_connected(void);
 const char *closer_demo_version(void);                       // the running firmware version

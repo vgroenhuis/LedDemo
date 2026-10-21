@@ -54,6 +54,7 @@ static struct {
     closer_wifi_phase_t phase;
     bool ever_connected;
     int64_t down_since_us;      // when the connection was lost (or start-up); 0 while connected
+    TaskHandle_t reporter;
 } S = {.clients = -1, .wifi = "Starting Wi-Fi"};
 
 // ------------------------------------------------------------------ flash settings
@@ -238,6 +239,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGI(TAG, "Got address " IPSTR, IP2STR(&e->ip_info.ip));
         S.attempts = 0;
         S.phase = CLOSER_WIFI_CONNECTED;
+        if (S.ever_connected && S.reporter) xTaskNotifyGive(S.reporter);     // back again: report now (new address?)
         S.ever_connected = true;
         S.down_since_us = 0;
         set_wifi_state("Connected");
@@ -325,6 +327,22 @@ static bool roam_scan(const wifi_ap_record_t *cur) {
     return moved;
 }
 
+static SemaphoreHandle_t scan_lock;      // one scan at a time (roaming or survey)
+
+esp_err_t closer_demo_scan_all(wifi_ap_record_t *out, uint16_t *n) {
+    if (!closer_demo_wifi_connected() || !scan_lock || xSemaphoreTake(scan_lock, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+    wifi_scan_config_t sc = {.show_hidden = false, .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+                             .scan_time = {.active = {.min = 20, .max = CONFIG_CLOSER_ROAM_SCAN_CHANNEL_MS}},
+                             .home_chan_dwell_time = CONFIG_CLOSER_ROAM_SCAN_DWELL_MS};
+    S.phase = CLOSER_WIFI_SCANNING;
+    esp_err_t e = esp_wifi_scan_start(&sc, true);
+    if (S.phase == CLOSER_WIFI_SCANNING) S.phase = CLOSER_WIFI_CONNECTED;
+    if (e == ESP_OK) e = esp_wifi_scan_get_ap_records(n, out);       // (sorted by signal; frees the rest)
+    else *n = 0;
+    xSemaphoreGive(scan_lock);
+    return e;
+}
+
 static void roam_task(void *arg) {
     xEventGroupWaitBits(S.events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     vTaskDelay(pdMS_TO_TICKS(10000));
@@ -337,8 +355,9 @@ static void roam_task(void *arg) {
             int64_t now = esp_timer_get_time() / 1000000;
             bool periodic = CONFIG_CLOSER_ROAM_PERIODIC_S > 0 && now - last_scan >= CONFIG_CLOSER_ROAM_PERIODIC_S;
             bool weak = cur.rssi < CONFIG_CLOSER_ROAM_RSSI && now - last_scan >= weak_wait;
-            if (first || periodic || weak) {
+            if ((first || periodic || weak) && xSemaphoreTake(scan_lock, pdMS_TO_TICKS(20000)) == pdTRUE) {
                 bool moved = roam_scan(&cur);
+                xSemaphoreGive(scan_lock);
                 first = false;
                 last_scan = esp_timer_get_time() / 1000000;
                 if (moved) weak_wait = 60;
@@ -553,7 +572,7 @@ static void report_task(void *arg) {
                 ESP_LOGI(TAG, "Firmware %s confirmed", S.version);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(S.pending_verify ? 15000 : CONFIG_CLOSER_INTERVAL_S * 1000));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(S.pending_verify ? 15000 : CONFIG_CLOSER_INTERVAL_S * 1000));
     }
 }
 
@@ -577,6 +596,7 @@ esp_err_t closer_demo_start(const char *hostname) {
     }
     ESP_ERROR_CHECK(err);
     S.lock = xSemaphoreCreateMutex();
+    scan_lock = xSemaphoreCreateMutex();
     S.events = xEventGroupCreate();
     strlcpy(S.hostname, hostname, sizeof S.hostname);
     strlcpy(S.version, esp_app_get_description()->version, sizeof S.version);
@@ -596,7 +616,7 @@ esp_err_t closer_demo_start(const char *hostname) {
     }
     ESP_LOGI(TAG, "Firmware %s%s", S.version, S.pending_verify ? " (new, unconfirmed)" : "");
     wifi_start();
-    xTaskCreate(report_task, "report", 8192, NULL, 4, NULL);
+    xTaskCreate(report_task, "report", 8192, NULL, 4, &S.reporter);
 #if CONFIG_CLOSER_ROAMING
     xTaskCreate(roam_task, "roam", 4096, NULL, 3, NULL);
 #endif

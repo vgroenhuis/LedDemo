@@ -80,6 +80,12 @@ the worst one sets the colour, green - yellow - red.
 | red flash every 1.5 s | no connection for more than 30 s |
 | purple double flash | the network refused the password |
 
+Since 1.6-1.8: the board keeps the last 10 minutes (1 sample a second: signal, loss, ping, quality, phase, access point;
+`GET /api/wifi/history`) and pushes the live state twice a second to WebSocket clients that send `stream` on `/ws` (the lab
+demos server relays it to the demo page: `"live": "/ws"`, `"wifi_panel": true` in demo.json). Every 30 s, while the LED shows
+the signal or someone watches, it scans all networks (`GET /api/wifi/aps`, also pushed on the stream). Pings during any
+scan are ignored (the radio is away on other channels). After a lost connection it reports to the server at once.
+
 `GET /api/wifi` gives the live numbers (the page shows them); the reports to the lab demos page include
 `ping_ms`, `ping_loss_pct` and `wifi_quality_pct`. `closer_demo_get_status()` now also gives the Wi-Fi phase,
 seconds without a connection, the gateway and the access point's BSSID.

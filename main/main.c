@@ -10,6 +10,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led_strip.h"
@@ -163,12 +164,20 @@ static void ping_add(bool ok, uint32_t rtt) {
     portEXIT_CRITICAL(&ping_mux);
 }
 
+// Pings during a scan (roaming or survey) are slow or lost because the radio is listening on other channels: they don't count.
+static bool scanning_now(void) {
+    closer_demo_status_t st = {0};
+    closer_demo_get_status(&st);
+    return st.phase == CLOSER_WIFI_SCANNING;
+}
+
 static void on_ping_ok(esp_ping_handle_t h, void *arg) {
+    if (scanning_now()) return;
     uint32_t ms = 0;
     esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &ms, sizeof ms);
     ping_add(true, ms);
 }
-static void on_ping_lost(esp_ping_handle_t h, void *arg) { ping_add(false, 0); }
+static void on_ping_lost(esp_ping_handle_t h, void *arg) { if (!scanning_now()) ping_add(false, 0); }
 
 static esp_ping_handle_t ping;
 
@@ -351,22 +360,241 @@ static void led_task(void *arg) {
 static const char *PHASE_NAMES[] = {"starting", "searching", "getting_ip", "connected", "scanning", "roaming",
                                     "reconnecting", "auth_failed"};
 
-static esp_err_t wifi_get(httpd_req_t *req) {
+// Phase as a word, with "offline" for a long time without a connection.
+static const char *phase_name(const closer_demo_status_t *st) {
+    if ((st->phase == CLOSER_WIFI_SEARCHING || st->phase == CLOSER_WIFI_RECONNECTING) && st->down_s >= OFFLINE_AFTER_S) return "offline";
+    return PHASE_NAMES[st->phase];
+}
+
+// The live state as JSON (GET /api/wifi, and pushed on /ws twice a second).
+static int wifi_json(char *out, size_t len) {
     closer_demo_status_t st = {0};
     closer_demo_get_status(&st);
-    const char *phase = PHASE_NAMES[st.phase];
-    if ((st.phase == CLOSER_WIFI_SEARCHING || st.phase == CLOSER_WIFI_RECONNECTING) && st.down_s >= OFFLINE_AFTER_S) phase = "offline";
+    int n = snprintf(out, len, "{\"wifi\":1,\"up_ms\":%lld,\"phase\":\"%s\",\"text\":\"%s\",\"ssid\":\"%s\",\"bssid\":\"%s\","
+                     "\"channel\":%d,\"rssi\":%d,\"target\":\"%s\",\"target_ip\":\"%s\",\"led\":\"%02x%02x%02x\"",
+                     esp_timer_get_time() / 1000, phase_name(&st), st.wifi, st.ssid, st.bssid, st.channel, st.rssi,
+                     TARGET_NAMES[W.target], W.target_ip, shown[0], shown[1], shown[2]);
+    if (W.have_ping) n += snprintf(out + n, len - n, ",\"loss\":%.0f,\"rtt\":%.0f", W.loss * 100, W.rtt);
+    if (W.quality >= 0) n += snprintf(out + n, len - n, ",\"quality\":%.0f", W.quality * 100);
+    n += snprintf(out + n, len - n, "}");
+    return n;
+}
+
+static esp_err_t wifi_get(httpd_req_t *req) {
     char out[512];
-    int n = snprintf(out, sizeof out, "{\"phase\":\"%s\",\"text\":\"%s\",\"ssid\":\"%s\",\"bssid\":\"%s\",\"channel\":%d,"
-                     "\"rssi\":%d,\"target\":\"%s\",\"target_ip\":\"%s\",\"led\":\"%02x%02x%02x\"",
-                     phase, st.wifi, st.ssid, st.bssid, st.channel, st.rssi, TARGET_NAMES[W.target], W.target_ip,
-                     shown[0], shown[1], shown[2]);
-    if (W.have_ping) n += snprintf(out + n, sizeof out - n, ",\"loss\":%.0f,\"rtt\":%.0f", W.loss * 100, W.rtt);
-    if (W.quality >= 0) n += snprintf(out + n, sizeof out - n, ",\"quality\":%.0f", W.quality * 100);
-    snprintf(out + n, sizeof out - n, "}");
+    wifi_json(out, sizeof out);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, out);
+}
+
+// ------------------------------------------------------------------ the last 10 minutes, one sample a second
+// Kept on the board, so time without a connection is in it too: the page fetches it again after a reconnect.
+
+#define HIST_LEN 600
+typedef struct {
+    int8_t rssi;        // dBm, 0 unknown
+    uint8_t loss;       // %, 255 unknown
+    uint16_t rtt;       // ms, 0xffff unknown
+    uint8_t quality;    // %, 255 unknown
+    uint8_t phase;      // index into HIST_PHASES
+    uint8_t bssid[6];   // the access point, zeros when none
+} sample_t;
+static const char *HIST_PHASES[] = {"starting", "searching", "getting_ip", "connected", "scanning", "roaming",
+                                    "reconnecting", "auth_failed", "offline"};
+static sample_t hist[HIST_LEN];
+static int hist_head, hist_count;
+static int64_t hist_last_ms;          // uptime of the newest sample
+static portMUX_TYPE hist_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void hist_record(void) {
+    closer_demo_status_t st = {0};
+    closer_demo_get_status(&st);
+    const char *ph = phase_name(&st);
+    sample_t s = {.rssi = st.rssi, .loss = 255, .rtt = 0xffff, .quality = 255, .phase = 0};
+    for (int i = 0; i < sizeof HIST_PHASES / sizeof HIST_PHASES[0]; i++) if (strcmp(ph, HIST_PHASES[i]) == 0) s.phase = i;
+    if (st.connected && W.have_ping) { s.loss = (uint8_t)roundf(W.loss * 100); s.rtt = W.rtt > 65000 ? 65000 : (uint16_t)roundf(W.rtt); }
+    if (st.connected && W.quality >= 0) s.quality = (uint8_t)roundf(W.quality * 100);
+    wifi_ap_record_t ap;
+    if (st.channel && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) memcpy(s.bssid, ap.bssid, 6);
+    portENTER_CRITICAL(&hist_mux);
+    hist[hist_head] = s;
+    hist_head = (hist_head + 1) % HIST_LEN;
+    if (hist_count < HIST_LEN) hist_count++;
+    hist_last_ms = esp_timer_get_time() / 1000;
+    portEXIT_CRITICAL(&hist_mux);
+}
+
+// {"up_ms": now, "last_ms": newest sample, "step_ms": 1000, "phases": [...], "s": [[rssi, loss, rtt, quality, phase, bssid], ...]}
+// oldest first; null for unknown; bssid "" for the same as the sample before (it rarely changes).
+static esp_err_t history_get(httpd_req_t *req) {
+    sample_t *copy = malloc(sizeof hist);
+    char *out = malloc(HIST_LEN * 56 + 400);     // (worst case: another access point every second)
+    if (!copy || !out) { free(copy); free(out); return httpd_resp_send_500(req); }
+    portENTER_CRITICAL(&hist_mux);
+    int count = hist_count, start = (hist_head - hist_count + HIST_LEN) % HIST_LEN;
+    int64_t last = hist_last_ms;
+    for (int i = 0; i < count; i++) copy[i] = hist[(start + i) % HIST_LEN];
+    portEXIT_CRITICAL(&hist_mux);
+    int n = sprintf(out, "{\"up_ms\":%lld,\"last_ms\":%lld,\"step_ms\":1000,\"phases\":[", esp_timer_get_time() / 1000, last);
+    for (int i = 0; i < sizeof HIST_PHASES / sizeof HIST_PHASES[0]; i++) n += sprintf(out + n, "%s\"%s\"", i ? "," : "", HIST_PHASES[i]);
+    n += sprintf(out + n, "],\"s\":[");
+    uint8_t prev[6] = {1};       // (no real BSSID: the first sample always has one)
+    for (int i = 0; i < count; i++) {
+        sample_t s = copy[i];
+        char a[8] = "null", b[8] = "null", c[8] = "null", d[8] = "null";
+        if (s.rssi) sprintf(a, "%d", s.rssi);
+        if (s.loss != 255) sprintf(b, "%u", s.loss);
+        if (s.rtt != 0xffff) sprintf(c, "%u", s.rtt);
+        if (s.quality != 255) sprintf(d, "%u", s.quality);
+        char e[24] = "";
+        if (memcmp(s.bssid, prev, 6) != 0) {
+            static const uint8_t zero[6];
+            if (memcmp(s.bssid, zero, 6) != 0) sprintf(e, "%02x:%02x:%02x:%02x:%02x:%02x", s.bssid[0], s.bssid[1], s.bssid[2], s.bssid[3], s.bssid[4], s.bssid[5]);
+            else strcpy(e, "-");
+            memcpy(prev, s.bssid, 6);
+        }
+        n += sprintf(out + n, "%s[%s,%s,%s,%s,%u,\"%s\"]", i ? "," : "", a, b, c, d, s.phase, e);
+    }
+    n += sprintf(out + n, "]}");
+    free(copy);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t e = httpd_resp_send(req, out, n);
+    free(out);
+    return e;
+}
+
+// ------------------------------------------------------------------ access points around (a survey every 30 s)
+
+#define SURVEY_MAX 40
+#define SURVEY_EVERY_S 30
+static wifi_ap_record_t survey[SURVEY_MAX];
+static uint16_t survey_n;
+static int64_t survey_ms;            // uptime of the last survey, 0 never
+static uint32_t survey_seq;
+static SemaphoreHandle_t survey_lock;
+static bool stream_has_viewers(void);
+
+// {"aps_seq": n, "age_ms": ..., "aps": [{"bssid","ssid","rssi","ch","cur"}, ...]}: strongest first.
+static int aps_json(char *out, size_t len) {
+    uint8_t cur[6] = {0};
+    wifi_ap_record_t now;
+    if (esp_wifi_sta_get_ap_info(&now) == ESP_OK) memcpy(cur, now.bssid, 6);
+    xSemaphoreTake(survey_lock, portMAX_DELAY);
+    int n = snprintf(out, len, "{\"aps_seq\":%lu,\"age_ms\":%lld,\"aps\":[", (unsigned long)survey_seq,
+                     survey_ms ? esp_timer_get_time() / 1000 - survey_ms : -1LL);
+    for (int i = 0; i < survey_n && n < (int)len - 160; i++) {
+        const wifi_ap_record_t *a = &survey[i];
+        char ssid[2 * 33 + 1];          // escaped for JSON (quotes, backslashes, control characters dropped)
+        int k = 0;
+        for (const char *s = (const char *)a->ssid; *s && k < (int)sizeof ssid - 2; s++) {
+            if ((unsigned char)*s < 0x20) continue;
+            if (*s == '"' || *s == '\\') ssid[k++] = '\\';
+            ssid[k++] = *s;
+        }
+        ssid[k] = 0;
+        n += snprintf(out + n, len - n, "%s{\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ssid\":\"%s\",\"rssi\":%d,\"ch\":%d,\"cur\":%d}",
+                      i ? "," : "", a->bssid[0], a->bssid[1], a->bssid[2], a->bssid[3], a->bssid[4], a->bssid[5], ssid, a->rssi,
+                      a->primary, memcmp(a->bssid, cur, 6) == 0);
+    }
+    xSemaphoreGive(survey_lock);
+    n += snprintf(out + n, len - n, "]}");
+    return n;
+}
+
+static esp_err_t aps_get(httpd_req_t *req) {
+    char *out = malloc(SURVEY_MAX * 150 + 100);
+    if (!out) return httpd_resp_send_500(req);
+    int n = aps_json(out, SURVEY_MAX * 150 + 100);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t e = httpd_resp_send(req, out, n);
+    free(out);
+    return e;
+}
+
+// Surveys while the LED shows the signal or someone watches the stream (a scan delays traffic a little).
+static void survey_task(void *arg) {
+    static wifi_ap_record_t recs[SURVEY_MAX];
+    int64_t last = -SURVEY_EVERY_S * 1000LL;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - last < SURVEY_EVERY_S * 1000LL || !(wifi_mode || stream_has_viewers()) || !closer_demo_wifi_connected()) continue;
+        uint16_t n = SURVEY_MAX;
+        if (closer_demo_scan_all(recs, &n) != ESP_OK) { last = now - (SURVEY_EVERY_S - 10) * 1000LL; continue; }   // busy: in 10 s
+        last = esp_timer_get_time() / 1000;
+        xSemaphoreTake(survey_lock, portMAX_DELAY);
+        memcpy(survey, recs, n * sizeof recs[0]);
+        survey_n = n;
+        survey_ms = last;
+        survey_seq++;
+        xSemaphoreGive(survey_lock);
+    }
+}
+
+// ------------------------------------------------------------------ live stream on /ws
+// A client that sends "stream" (the lab demos server's live relay does) gets the live state twice a second.
+
+#define MAX_STREAMS 3
+static httpd_handle_t server;
+static int stream_fds[MAX_STREAMS] = {-1, -1, -1};
+static portMUX_TYPE stream_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void stream_add(int fd) {
+    portENTER_CRITICAL(&stream_mux);
+    bool known = false;
+    for (int i = 0; i < MAX_STREAMS; i++) known |= stream_fds[i] == fd;
+    for (int i = 0; i < MAX_STREAMS && !known; i++) if (stream_fds[i] < 0) { stream_fds[i] = fd; known = true; }
+    portEXIT_CRITICAL(&stream_mux);
+}
+
+static bool stream_has_viewers(void) {
+    bool any = false;
+    for (int i = 0; i < MAX_STREAMS; i++) any |= stream_fds[i] >= 0;
+    return any;
+}
+
+static void stream_send_text(const char *buf, int n);
+static void stream_send(void) {
+    static uint32_t sent_seq;
+    char buf[512];
+    int n = wifi_json(buf, sizeof buf);
+    stream_send_text(buf, n);
+    if (survey_seq != sent_seq && stream_has_viewers()) {     // a new survey: once, to whoever is watching
+        sent_seq = survey_seq;
+        char *aps = malloc(SURVEY_MAX * 150 + 100);
+        if (aps) { stream_send_text(aps, aps_json(aps, SURVEY_MAX * 150 + 100)); free(aps); }
+    }
+}
+
+static void stream_send_text(const char *buf, int n) {
+    int fds[MAX_STREAMS], count = 0;
+    portENTER_CRITICAL(&stream_mux);
+    for (int i = 0; i < MAX_STREAMS; i++) if (stream_fds[i] >= 0) fds[count++] = stream_fds[i];
+    portEXIT_CRITICAL(&stream_mux);
+    if (!count || !server) return;
+    httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)buf, .len = n};
+    for (int k = 0; k < count; k++) {
+        bool alive = httpd_ws_get_fd_info(server, fds[k]) == HTTPD_WS_CLIENT_WEBSOCKET &&
+                     httpd_ws_send_frame_async(server, fds[k], &frame) == ESP_OK;
+        if (!alive) {
+            portENTER_CRITICAL(&stream_mux);
+            for (int i = 0; i < MAX_STREAMS; i++) if (stream_fds[i] == fds[k]) stream_fds[i] = -1;
+            portEXIT_CRITICAL(&stream_mux);
+        }
+    }
+}
+
+static void wifi_task(void *arg) {
+    int64_t last_sample = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(PING_INTERVAL_MS));
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - last_sample >= 1000) { last_sample = now; hist_record(); }
+        stream_send();
+    }
 }
 
 static void stats_task(void *arg) {
@@ -429,7 +657,8 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     if (frame.type == HTTPD_WS_TYPE_TEXT) {
         buf[frame.len] = 0;
         touch_client(req);
-        set_from_text(buf);
+        if (strcmp(buf, "stream") == 0) stream_add(httpd_req_to_sockfd(req));
+        else set_from_text(buf);
     }
     return ESP_OK;
 }
@@ -458,13 +687,18 @@ static void web_start(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
+    cfg.max_uri_handlers = 12;
+    cfg.send_wait_timeout = 2;       // a stalled viewer must not hold the others up for long
     httpd_handle_t srv;
     ESP_ERROR_CHECK(httpd_start(&srv, &cfg));
+    server = srv;
     httpd_uri_t uris[] = {
         {.uri = "/", .method = HTTP_GET, .handler = page_get},
         {.uri = "/api/led", .method = HTTP_GET, .handler = led_get},
         {.uri = "/api/led", .method = HTTP_POST, .handler = led_post},
         {.uri = "/api/wifi", .method = HTTP_GET, .handler = wifi_get},
+        {.uri = "/api/wifi/history", .method = HTTP_GET, .handler = history_get},
+        {.uri = "/api/wifi/aps", .method = HTTP_GET, .handler = aps_get},
         {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
     };
     for (int i = 0; i < sizeof uris / sizeof uris[0]; i++) httpd_register_uri_handler(srv, &uris[i]);
@@ -489,6 +723,9 @@ void app_main(void) {
     }
     web_start();
     xTaskCreate(led_task, "led", 4096, NULL, 4, NULL);
+    survey_lock = xSemaphoreCreateMutex();
+    xTaskCreate(wifi_task, "wifi-live", 4096, NULL, 3, NULL);
+    xTaskCreate(survey_task, "survey", 3072, NULL, 2, NULL);
     xTaskCreate(stats_task, "stats", 3072, NULL, 2, NULL);
     ESP_LOGI(TAG, "Turtle running, firmware %s", closer_demo_version());
 }
