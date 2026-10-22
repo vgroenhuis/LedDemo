@@ -99,5 +99,6 @@ function poll(){fetch('api/wifi',{cache:'no-store'}).then(r=>r.json()).then(w=>{
   b.onclick=()=>{$('col').value=c;send();};$('pre').appendChild(b);});
 setMode('fixed',false);
 fetch('api/led').then(r=>r.json()).then(s=>{const hex='#'+s.hex;$('col').value=hex==='#000000'?'#00a0ff':hex;$('br').value=s.brightness;
-  show(hex==='#000000'?'var(--bg)':hex,s.brightness);if(s.mode==='wifi')setMode('wifi',false);$('info').textContent='Firmware '+s.fw+' · '+s.host;}).catch(()=>{});
+  show(hex==='#000000'?'var(--bg)':hex,s.brightness);if(s.mode==='wifi')setMode('wifi',false);$('info').textContent='Firmware '+s.fw+' · '+s.host;
+  if(s.host&&s.host!=='turtle'){const t=s.host.replace(/^./,c=>c.toUpperCase());document.title=t;document.querySelector('h1').textContent=t;}}).catch(()=>{});
 </script></body></html>

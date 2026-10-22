@@ -153,6 +153,29 @@ void closer_demo_get_status(closer_demo_status_t *out) {
 
 bool closer_demo_wifi_connected(void) { return S.events && (xEventGroupGetBits(S.events) & WIFI_CONNECTED_BIT); }
 const char *closer_demo_version(void) { return S.version; }
+const char *closer_demo_name(void) { return S.hostname; }
+
+// Why the chip last started: sent with the "boot" report.
+const char *closer_demo_reset_reason(void) {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON: return "power_on";      // power applied (plugged in, or the supply went away and back)
+        case ESP_RST_EXT: return "reset_pin";
+        case ESP_RST_SW: return "software";           // esp_restart(): an update, or asked to
+        case ESP_RST_PANIC: return "crash";
+        case ESP_RST_INT_WDT: return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
+        case ESP_RST_BROWNOUT: return "brownout";     // the supply voltage dipped
+        case ESP_RST_SDIO: return "sdio";
+        case ESP_RST_USB: return "usb";
+        case ESP_RST_JTAG: return "jtag";
+        case ESP_RST_EFUSE: return "efuse";
+        case ESP_RST_PWR_GLITCH: return "power_glitch";
+        case ESP_RST_CPU_LOCKUP: return "cpu_lockup";
+        default: return "unknown";
+    }
+}
 
 // ------------------------------------------------------------------ Wi-Fi
 
@@ -412,6 +435,7 @@ static void set_auth(esp_http_client_handle_t c) {
 static char *build_report(const char *event) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "event", event);
+    if (strcmp(event, "boot") == 0) cJSON_AddStringToObject(j, "reset", closer_demo_reset_reason());
     esp_netif_ip_info_t ip;
     esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK) {
@@ -559,6 +583,24 @@ static bool report(const char *event) {
     return ok;
 }
 
+int closer_demo_post(const char *path, const char *body, size_t len) {
+    if (!closer_demo_wifi_connected()) return -1;
+    char url[192];
+    snprintf(url, sizeof url, "%s%s", S.base, path);
+    char resp[256] = {0};
+    rx_t rx = {.buf = resp, .cap = sizeof resp};
+    esp_http_client_config_t cfg = {.url = url, .method = HTTP_METHOD_POST, .event_handler = on_http, .user_data = &rx,
+                                    .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 15000};
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return -1;
+    set_auth(c);
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    esp_http_client_set_post_field(c, body, len);
+    int status = esp_http_client_perform(c) == ESP_OK ? esp_http_client_get_status_code(c) : -1;
+    esp_http_client_cleanup(c);
+    return status;
+}
+
 static void report_task(void *arg) {
     xEventGroupWaitBits(S.events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     time_sync();
@@ -598,9 +640,16 @@ esp_err_t closer_demo_start(const char *hostname) {
     S.lock = xSemaphoreCreateMutex();
     scan_lock = xSemaphoreCreateMutex();
     S.events = xEventGroupCreate();
-    strlcpy(S.hostname, hostname, sizeof S.hostname);
     strlcpy(S.version, esp_app_get_description()->version, sizeof S.version);
     load_settings();
+    // The name: given, or the demo id at the front of the device key ("turtle-2.<secret>"), so one firmware serves
+    // several boards.
+    if (hostname && hostname[0]) strlcpy(S.hostname, hostname, sizeof S.hostname);
+    else {
+        size_t n = strcspn(S.key, ".");
+        if (n == 0 || n >= sizeof S.hostname) strlcpy(S.hostname, "closer-demo", sizeof S.hostname);
+        else { memcpy(S.hostname, S.key, n); S.hostname[n] = 0; }
+    }
     if (!S.ssid[0] || !S.key[0]) ESP_LOGE(TAG, "No Wi-Fi network or device key in flash: see tools/provision.py");
 
     esp_ota_img_states_t state;

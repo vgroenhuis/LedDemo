@@ -16,8 +16,12 @@
 extern "C" {
 #endif
 
-// Starts Wi-Fi, time, reporting and updates in the background. hostname: e.g. "turtle" (reachable as turtle.local too).
+// Starts Wi-Fi, time, reporting and updates in the background. hostname: e.g. "turtle" (reachable as turtle.local too);
+// NULL: the demo id in the device key (so one firmware can serve several boards).
 esp_err_t closer_demo_start(const char *hostname);
+const char *closer_demo_name(void);
+// Why the chip last started ("power_on", "brownout", "crash", "task_watchdog", "software", ...).
+const char *closer_demo_reset_reason(void);                          // the hostname in use
 
 void closer_demo_set_stat(const char *name, float value);   // name: [a-z][a-z0-9_]{0,23}
 void closer_demo_set_clients(int n);
@@ -62,6 +66,10 @@ void closer_demo_get_status(closer_demo_status_t *out);
 // and fills up to *n records, strongest first; *n becomes the number filled. Only while connected.
 // ESP_ERR_INVALID_STATE while not connected or while another scan runs.
 esp_err_t closer_demo_scan_all(wifi_ap_record_t *out, uint16_t *n);
+
+// POSTs JSON to the lab demos server (path after the base URL, e.g. "/api/survey-data"), authenticated with the
+// device key. Returns the HTTP status, or -1 if it couldn't be sent (not connected, network error).
+int closer_demo_post(const char *path, const char *body, size_t len);
 
 bool closer_demo_wifi_connected(void);
 const char *closer_demo_version(void);                       // the running firmware version

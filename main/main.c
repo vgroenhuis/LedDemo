@@ -4,6 +4,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "closer_demo.h"
 #include "driver/gpio.h"
@@ -467,7 +469,7 @@ static esp_err_t history_get(httpd_req_t *req) {
 
 // ------------------------------------------------------------------ access points around (a survey every 30 s)
 
-#define SURVEY_MAX 40
+#define SURVEY_MAX 60
 #define SURVEY_EVERY_S 30
 static wifi_ap_record_t survey[SURVEY_MAX];
 static uint16_t survey_n;
@@ -514,23 +516,277 @@ static esp_err_t aps_get(httpd_req_t *req) {
     return e;
 }
 
-// Surveys while the LED shows the signal or someone watches the stream (a scan delays traffic a little).
+// ------------------------------------------------------------------ survey sessions
+// Started from the lab demos page (POST /api/survey?minutes=60&interval=15): for that long, a full scan every interval;
+// each scan, with the board's own connection and what happened to it since the last one, is sent to the server
+// (/api/survey-data), which keeps it and analyses the session. Scans that can't be sent wait on the board (up to 24).
+
+#define SV_BACKLOG 24
+#define SV_EVENTS 32
+static struct {
+    bool active;
+    int64_t end_ms;            // uptime when it stops
+    int interval_s;
+    uint32_t session;          // its start (Unix time): the session's name on the server
+    uint32_t end_unix;         // when it stops (Unix time), kept in flash with the rest: see sv_save
+    uint32_t seq, sent, failed, dropped;
+    const char *restart;       // the board restarted during the survey (why): told with the next scan
+    char *backlog[SV_BACKLOG];
+    int backlog_n;
+} SV;
+static struct { uint32_t t; uint8_t phase; uint8_t bssid[6]; uint8_t ch; int8_t rssi; } sv_ev[SV_EVENTS];
+static int sv_ev_n;
+static portMUX_TYPE sv_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t now_unix(void) { return (uint32_t)time(NULL); }
+
+// Called twice a second: notes every change of phase or access point (what the board itself went through).
+static void sv_watch(void) {
+    static int last_phase = -1;
+    static uint8_t last_bssid[6];
+    if (!SV.active) { last_phase = -1; return; }
+    closer_demo_status_t st = {0};
+    closer_demo_get_status(&st);
+    int ph = 0;
+    const char *name = phase_name(&st);
+    for (int i = 0; i < sizeof HIST_PHASES / sizeof HIST_PHASES[0]; i++) if (strcmp(name, HIST_PHASES[i]) == 0) ph = i;
+    uint8_t b[6] = {0};
+    wifi_ap_record_t ap;
+    if (st.channel && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) memcpy(b, ap.bssid, 6);
+    if (ph == CLOSER_WIFI_SCANNING) ph = CLOSER_WIFI_CONNECTED;     // (our own scans are not news)
+    if (ph == last_phase && memcmp(b, last_bssid, 6) == 0) return;
+    last_phase = ph;
+    memcpy(last_bssid, b, 6);
+    portENTER_CRITICAL(&sv_mux);
+    if (sv_ev_n < SV_EVENTS) {
+        sv_ev[sv_ev_n].t = now_unix();
+        sv_ev[sv_ev_n].phase = ph;
+        memcpy(sv_ev[sv_ev_n].bssid, b, 6);
+        sv_ev[sv_ev_n].ch = st.channel;
+        sv_ev[sv_ev_n].rssi = st.rssi;
+        sv_ev_n++;
+    }
+    portEXIT_CRITICAL(&sv_mux);
+}
+
+static int bw_mhz(wifi_bandwidth_t b) {
+    switch (b) { case WIFI_BW_HT20: return 20; case WIFI_BW_HT40: return 40; case WIFI_BW80: return 80;
+                 case WIFI_BW160: return 160; case WIFI_BW80_BW80: return 8080; default: return 0; }
+}
+static const char *phy_name(const wifi_ap_record_t *a) {
+    return a->phy_11ax ? "ax" : a->phy_11ac ? "ac" : a->phy_11n ? "n" : a->phy_11a ? "a" : a->phy_11g ? "g" : a->phy_11b ? "b" : "";
+}
+
+// {"session","seq","t","interval","end","self":{...},["restart":why,]"events":[[t,phase,bssid,ch,rssi]...],
+//  "aps":[[bssid,ssid,rssi,ch,second,bw,center1,center2,phy,auth,bss_color],...]}
+static char *sv_build(const wifi_ap_record_t *recs, int n) {
+    size_t cap = 600 + n * 190 + SV_EVENTS * 64;
+    char *o = malloc(cap);
+    if (!o) return NULL;
+    closer_demo_status_t st = {0};
+    closer_demo_get_status(&st);
+    int k = snprintf(o, cap, "{\"session\":%lu,\"seq\":%lu,\"t\":%lu,\"interval\":%d,\"end\":%lu,\"fw\":\"%s\","
+                     "\"self\":{\"bssid\":\"%s\",\"ch\":%d,\"rssi\":%d,\"phase\":\"%s\"",
+                     (unsigned long)SV.session, (unsigned long)SV.seq, (unsigned long)now_unix(), SV.interval_s,
+                     (unsigned long)(now_unix() + (SV.end_ms - esp_timer_get_time() / 1000) / 1000), closer_demo_version(),
+                     st.bssid, st.channel, st.rssi, phase_name(&st));
+    if (W.have_ping) k += snprintf(o + k, cap - k, ",\"rtt\":%.0f,\"loss\":%.0f", W.rtt, W.loss * 100);
+    k += snprintf(o + k, cap - k, "}");
+    if (SV.restart) {
+        k += snprintf(o + k, cap - k, ",\"restart\":\"%s\"", SV.restart);
+        SV.restart = NULL;
+    }
+    k += snprintf(o + k, cap - k, ",\"events\":[");
+    portENTER_CRITICAL(&sv_mux);
+    int ne = sv_ev_n;
+    typeof(sv_ev[0]) ev[SV_EVENTS];
+    memcpy(ev, sv_ev, ne * sizeof ev[0]);
+    sv_ev_n = 0;
+    portEXIT_CRITICAL(&sv_mux);
+    for (int i = 0; i < ne; i++)
+        k += snprintf(o + k, cap - k, "%s[%lu,\"%s\",\"%02x:%02x:%02x:%02x:%02x:%02x\",%d,%d]", i ? "," : "", (unsigned long)ev[i].t,
+                      HIST_PHASES[ev[i].phase], ev[i].bssid[0], ev[i].bssid[1], ev[i].bssid[2], ev[i].bssid[3], ev[i].bssid[4],
+                      ev[i].bssid[5], ev[i].ch, ev[i].rssi);
+    k += snprintf(o + k, cap - k, "],\"aps\":[");
+    for (int i = 0; i < n && k < (int)cap - 200; i++) {
+        const wifi_ap_record_t *a = &recs[i];
+        char ssid[2 * 33 + 1];
+        int m = 0;
+        for (const char *s = (const char *)a->ssid; *s && m < (int)sizeof ssid - 2; s++) {
+            if ((unsigned char)*s < 0x20) continue;
+            if (*s == '"' || *s == '\\') ssid[m++] = '\\';
+            ssid[m++] = *s;
+        }
+        ssid[m] = 0;
+        k += snprintf(o + k, cap - k, "%s[\"%02x:%02x:%02x:%02x:%02x:%02x\",\"%s\",%d,%d,%d,%d,%d,%d,\"%s\",%d,%d]", i ? "," : "",
+                      a->bssid[0], a->bssid[1], a->bssid[2], a->bssid[3], a->bssid[4], a->bssid[5], ssid, a->rssi, a->primary,
+                      a->second, bw_mhz(a->bandwidth), a->vht_ch_freq1, a->vht_ch_freq2, phy_name(a), a->authmode,
+                      a->phy_11ax ? a->he_ap.bss_color : -1);
+    }
+    snprintf(o + k, cap - k, "]}");
+    return o;
+}
+
+static void sv_queue(char *json) {
+    if (SV.backlog_n == SV_BACKLOG) {          // full: the oldest goes
+        free(SV.backlog[0]);
+        memmove(SV.backlog, SV.backlog + 1, (SV_BACKLOG - 1) * sizeof SV.backlog[0]);
+        SV.backlog_n--;
+        SV.dropped++;
+    }
+    SV.backlog[SV.backlog_n++] = json;
+}
+
+static void sv_flush(void) {
+    while (SV.backlog_n && closer_demo_wifi_connected()) {
+        int status = closer_demo_post("/api/survey-data", SV.backlog[0], strlen(SV.backlog[0]));
+        if (status == 200 || status == 400 || status == 413) {      // (a scan the server won't take is not retried)
+            if (status != 200) SV.failed++; else SV.sent++;
+            free(SV.backlog[0]);
+            memmove(SV.backlog, SV.backlog + 1, (SV_BACKLOG - 1) * sizeof SV.backlog[0]);
+            SV.backlog_n--;
+        } else {
+            SV.failed++;
+            break;
+        }
+    }
+}
+
+// A running survey is also kept in flash, so it carries on after a restart (a power dip, a crash).
+typedef struct { uint32_t session, end_unix, seq, interval_s; } sv_saved_t;
+
+static void sv_save(void) {
+    nvs_handle_t h;
+    if (nvs_open("turtle", NVS_READWRITE, &h) != ESP_OK) return;
+    if (SV.active) {
+        sv_saved_t v = {SV.session, SV.end_unix, SV.seq, SV.interval_s};
+        nvs_set_blob(h, "survey", &v, sizeof v);
+    } else {
+        nvs_erase_key(h, "survey");
+    }
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// After a restart: picks the saved survey up again. False while the clock isn't right yet (try again later).
+static bool sv_resume(void) {
+    sv_saved_t v;
+    size_t len = sizeof v;
+    nvs_handle_t h;
+    if (nvs_open("turtle", NVS_READONLY, &h) != ESP_OK) return true;
+    esp_err_t err = nvs_get_blob(h, "survey", &v, &len);
+    nvs_close(h);
+    if (err != ESP_OK || len != sizeof v) return true;
+    uint32_t now = now_unix();
+    if (now < v.session) return false;                 // (no NTP answer yet: the clock is still the build time)
+    if (now >= v.end_unix || v.end_unix - v.session > 1441 * 60) {
+        SV.active = false;
+        sv_save();
+        return true;
+    }
+    SV.session = v.session;
+    SV.end_unix = v.end_unix;
+    SV.seq = v.seq;
+    SV.interval_s = v.interval_s;
+    SV.sent = SV.failed = SV.dropped = 0;
+    SV.end_ms = esp_timer_get_time() / 1000 + (int64_t)(v.end_unix - now) * 1000;
+    SV.restart = closer_demo_reset_reason();
+    SV.active = true;
+    ESP_LOGI(TAG, "Survey %lu resumed after a restart (%s): %lu s left", (unsigned long)SV.session, SV.restart,
+             (unsigned long)(v.end_unix - now));
+    return true;
+}
+
+static void sv_start(int minutes, int interval_s) {
+    SV.session = now_unix();
+    SV.end_unix = SV.session + minutes * 60;
+    SV.seq = SV.sent = SV.failed = SV.dropped = 0;
+    SV.interval_s = interval_s;
+    SV.end_ms = esp_timer_get_time() / 1000 + minutes * 60000LL;
+    SV.restart = NULL;
+    portENTER_CRITICAL(&sv_mux);
+    sv_ev_n = 0;
+    portEXIT_CRITICAL(&sv_mux);
+    SV.active = true;
+    sv_save();
+    ESP_LOGI(TAG, "Survey %lu: %d min, a scan every %d s", (unsigned long)SV.session, minutes, interval_s);
+}
+
+static int sv_json(char *out, size_t len) {
+    int64_t left = SV.active ? (SV.end_ms - esp_timer_get_time() / 1000) / 1000 : 0;
+    return snprintf(out, len, "{\"active\":%s,\"session\":%lu,\"interval\":%d,\"left_s\":%lld,\"scans\":%lu,\"sent\":%lu,"
+                    "\"failed\":%lu,\"dropped\":%lu,\"waiting\":%d}", SV.active ? "true" : "false", (unsigned long)SV.session,
+                    SV.interval_s, left > 0 ? left : 0, (unsigned long)SV.seq, (unsigned long)SV.sent, (unsigned long)SV.failed,
+                    (unsigned long)SV.dropped, SV.backlog_n);
+}
+
+// GET: the survey's state. POST ?minutes=60&interval=15 starts one (minutes 1-1440, interval 10-600 s); ?stop=1 ends it.
+static esp_err_t survey_handler(httpd_req_t *req) {
+    touch(req);
+    if (req->method == HTTP_POST) {
+        char q[96], v[16];
+        if (httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK) {
+            if (httpd_query_key_value(q, "stop", v, sizeof v) == ESP_OK) {
+                SV.active = false;
+                sv_save();
+            } else {
+                int minutes = 60, interval = 15;
+                if (httpd_query_key_value(q, "minutes", v, sizeof v) == ESP_OK) minutes = atoi(v);
+                if (httpd_query_key_value(q, "interval", v, sizeof v) == ESP_OK) interval = atoi(v);
+                if (minutes < 1 || minutes > 1440 || interval < 10 || interval > 600) {
+                    httpd_resp_set_status(req, "400 Bad Request");
+                    return httpd_resp_sendstr(req, "{\"error\":\"minutes 1-1440, interval 10-600\"}");
+                }
+                if (now_unix() < 1700000000) {
+                    httpd_resp_set_status(req, "503 Service Unavailable");
+                    return httpd_resp_sendstr(req, "{\"error\":\"the board's clock isn't set yet\"}");
+                }
+                sv_start(minutes, interval);
+            }
+        }
+    }
+    char out[256];
+    sv_json(out, sizeof out);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, out);
+}
+
+// Scans: every SURVEY_EVERY_S while the LED shows the signal or someone watches the stream, and at the survey's
+// interval while a survey runs (a scan delays traffic a little).
 static void survey_task(void *arg) {
     static wifi_ap_record_t recs[SURVEY_MAX];
     int64_t last = -SURVEY_EVERY_S * 1000LL;
+    bool resume = true;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
         int64_t now = esp_timer_get_time() / 1000;
-        if (now - last < SURVEY_EVERY_S * 1000LL || !(wifi_mode || stream_has_viewers()) || !closer_demo_wifi_connected()) continue;
+        if (resume && closer_demo_wifi_connected()) resume = !sv_resume() && now < 180000;   // (give up on the clock after 3 min)
+        if (SV.active && now >= SV.end_ms) {
+            SV.active = false;
+            sv_save();
+            ESP_LOGI(TAG, "Survey %lu done: %lu scans", (unsigned long)SV.session, (unsigned long)SV.seq);
+        }
+        if (SV.backlog_n) sv_flush();
+        int every = SV.active ? SV.interval_s : SURVEY_EVERY_S;
+        bool wanted = SV.active || wifi_mode || stream_has_viewers();
+        if (now - last < every * 1000LL || !wanted || !closer_demo_wifi_connected()) continue;
         uint16_t n = SURVEY_MAX;
-        if (closer_demo_scan_all(recs, &n) != ESP_OK) { last = now - (SURVEY_EVERY_S - 10) * 1000LL; continue; }   // busy: in 10 s
-        last = esp_timer_get_time() / 1000;
+        if (closer_demo_scan_all(recs, &n) != ESP_OK) { last = now - (every - 5) * 1000LL; continue; }   // busy: in 5 s
+        last = now;                                   // (the interval runs from start to start: a full scan takes ~10 s)
         xSemaphoreTake(survey_lock, portMAX_DELAY);
         memcpy(survey, recs, n * sizeof recs[0]);
         survey_n = n;
-        survey_ms = last;
+        survey_ms = esp_timer_get_time() / 1000;
         survey_seq++;
         xSemaphoreGive(survey_lock);
+        if (SV.active) {
+            SV.seq++;
+            sv_save();
+            char *j = sv_build(recs, n);
+            if (j) sv_queue(j);
+            sv_flush();
+        }
     }
 }
 
@@ -593,6 +849,7 @@ static void wifi_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(PING_INTERVAL_MS));
         int64_t now = esp_timer_get_time() / 1000;
         if (now - last_sample >= 1000) { last_sample = now; hist_record(); }
+        sv_watch();
         stream_send();
     }
 }
@@ -621,8 +878,8 @@ static esp_err_t page_get(httpd_req_t *req) {
 
 static esp_err_t led_get(httpd_req_t *req) {
     char out[192];
-    snprintf(out, sizeof out, "{\"hex\":\"%02x%02x%02x\",\"brightness\":%d,\"mode\":\"%s\",\"fw\":\"%s\",\"host\":\"turtle\"}",
-             rgb[0], rgb[1], rgb[2], brightness, wifi_mode ? "wifi" : "fixed", closer_demo_version());
+    snprintf(out, sizeof out, "{\"hex\":\"%02x%02x%02x\",\"brightness\":%d,\"mode\":\"%s\",\"fw\":\"%s\",\"host\":\"%s\"}",
+             rgb[0], rgb[1], rgb[2], brightness, wifi_mode ? "wifi" : "fixed", closer_demo_version(), closer_demo_name());
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, out);
 }
@@ -687,7 +944,7 @@ static void web_start(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 14;
     cfg.send_wait_timeout = 2;       // a stalled viewer must not hold the others up for long
     httpd_handle_t srv;
     ESP_ERROR_CHECK(httpd_start(&srv, &cfg));
@@ -699,13 +956,15 @@ static void web_start(void) {
         {.uri = "/api/wifi", .method = HTTP_GET, .handler = wifi_get},
         {.uri = "/api/wifi/history", .method = HTTP_GET, .handler = history_get},
         {.uri = "/api/wifi/aps", .method = HTTP_GET, .handler = aps_get},
+        {.uri = "/api/survey", .method = HTTP_GET, .handler = survey_handler},
+        {.uri = "/api/survey", .method = HTTP_POST, .handler = survey_handler},
         {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
     };
     for (int i = 0; i < sizeof uris / sizeof uris[0]; i++) httpd_register_uri_handler(srv, &uris[i]);
 }
 
 void app_main(void) {
-    closer_demo_start("turtle");        // also initialises NVS
+    closer_demo_start(NULL);            // (named after its key: turtle, turtle-2, ...) also initialises NVS
     led_strip_config_t sc = {.strip_gpio_num = CONFIG_TURTLE_LED_GPIO, .max_leds = 1, .led_model = LED_MODEL_WS2812,
                              .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB};
     led_strip_rmt_config_t rc = {.clk_src = RMT_CLK_SRC_DEFAULT, .resolution_hz = 10 * 1000 * 1000};
@@ -725,7 +984,7 @@ void app_main(void) {
     xTaskCreate(led_task, "led", 4096, NULL, 4, NULL);
     survey_lock = xSemaphoreCreateMutex();
     xTaskCreate(wifi_task, "wifi-live", 4096, NULL, 3, NULL);
-    xTaskCreate(survey_task, "survey", 3072, NULL, 2, NULL);
+    xTaskCreate(survey_task, "survey", 8192, NULL, 2, NULL);      // (it also uploads: TLS)
     xTaskCreate(stats_task, "stats", 3072, NULL, 2, NULL);
     ESP_LOGI(TAG, "Turtle running, firmware %s", closer_demo_version());
 }
