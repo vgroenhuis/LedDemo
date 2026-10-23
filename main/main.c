@@ -570,7 +570,7 @@ static void sv_watch(void) {
 }
 
 static int bw_mhz(wifi_bandwidth_t b) {
-    switch (b) { case WIFI_BW_HT20: return 20; case WIFI_BW_HT40: return 40; case WIFI_BW80: return 80;
+    switch (b) { case WIFI_BW20: return 20; case WIFI_BW40: return 40; case WIFI_BW80: return 80;
                  case WIFI_BW160: return 160; case WIFI_BW80_BW80: return 8080; default: return 0; }
 }
 static const char *phy_name(const wifi_ap_record_t *a) {

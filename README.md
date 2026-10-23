@@ -1,4 +1,4 @@
-# Turtle: RGB LED demo (ESP32-C5-DevKitC-1, ESP-IDF 5.5)
+# Turtle: RGB LED demo (ESP32-C5-DevKitC-1, ESP-IDF 6.1)
 
 > This is the firmware side of the CloSer lab demos (https://closer.ram.eemcs.utwente.nl/labdemos/). The server side
 > (demo list, heartbeat API, firmware releases) runs on the CloSer server and is not part of this repository: the board
@@ -12,7 +12,7 @@ A web page sets the colour of the on-board WS2812 LED (GPIO27, see `idf.py menuc
 over-the-air updates with automatic rollback. A new demo is a new `main/` that calls `closer_demo_start("name")`.
 
 ## Build (on the server)
-    . ~/esp/idf-env.sh            # ESP-IDF 5.5.5 (+ the Python 3.12 it needs) in ~/esp
+    . ~/esp/idf-env.sh            # ESP-IDF 6.1 (+ the Python 3.12 it needs) in ~/esp
     cd ~/closer-deploy/labdemos/firmware/turtle
     idf.py build
 

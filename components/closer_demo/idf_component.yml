@@ -1,0 +1,3 @@
+# cJSON: built into ESP-IDF up to 5.x, a registry component since 6.0.
+dependencies:
+  espressif/cjson: "^1.7.19"

@@ -21,7 +21,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "mbedtls/sha256.h"
+#include "psa/crypto.h"          // SHA-256 (mbedTLS 4 in ESP-IDF 6 has only the PSA API; 5.x has it too)
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -209,7 +209,7 @@ static const char *reason_text(int r) {
         case WIFI_REASON_HANDSHAKE_TIMEOUT:
         case WIFI_REASON_MIC_FAILURE: return "Wrong password?";
         case WIFI_REASON_ASSOC_FAIL:
-        case WIFI_REASON_ASSOC_EXPIRE:
+        case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY:
         case WIFI_REASON_AUTH_EXPIRE: return "Access point refused";
         case WIFI_REASON_BEACON_TIMEOUT: return "Signal lost";
         case WIFI_REASON_ASSOC_LEAVE: return "Disconnected";
@@ -493,11 +493,10 @@ static void ota_task(void *arg) {
     esp_http_client_config_t cfg = {.url = url, .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 15000, .buffer_size = 2048};
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     bool ok = false;
-    mbedtls_sha256_context sha;
-    mbedtls_sha256_init(&sha);
-    mbedtls_sha256_starts(&sha, 0);
+    psa_hash_operation_t sha = PSA_HASH_OPERATION_INIT;
+    bool sha_ok = psa_crypto_init() == PSA_SUCCESS && psa_hash_setup(&sha, PSA_ALG_SHA_256) == PSA_SUCCESS;
     char *buf = malloc(4096);
-    if (c && slot && buf) {
+    if (c && slot && buf && sha_ok) {
         set_auth(c);
         if (esp_http_client_open(c, 0) == ESP_OK) {
             int total = esp_http_client_fetch_headers(c);
@@ -506,14 +505,15 @@ static void ota_task(void *arg) {
                 int got = 0, n;
                 ok = true;
                 while ((n = esp_http_client_read(c, buf, 4096)) > 0) {
-                    mbedtls_sha256_update(&sha, (uint8_t *)buf, n);
+                    if (psa_hash_update(&sha, (uint8_t *)buf, n) != PSA_SUCCESS) { ok = false; break; }
                     if (esp_ota_write(ota, buf, n) != ESP_OK) { ok = false; break; }
                     got += n;
                 }
                 ok = ok && got == total;
                 uint8_t digest[32];
                 char dh[65];
-                mbedtls_sha256_finish(&sha, digest);
+                size_t dlen = 0;
+                if (psa_hash_finish(&sha, digest, sizeof digest, &dlen) != PSA_SUCCESS || dlen != 32) ok = false;
                 hex(digest, 32, dh);
                 if (ok && strcasecmp(dh, want_sha) != 0) { ESP_LOGE(TAG, "SHA-256 mismatch"); ok = false; }
                 if (ok && esp_ota_end(ota) != ESP_OK) ok = false;
@@ -524,7 +524,7 @@ static void ota_task(void *arg) {
             }
         }
     }
-    mbedtls_sha256_free(&sha);
+    psa_hash_abort(&sha);
     free(buf);
     if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
     if (ok) {
