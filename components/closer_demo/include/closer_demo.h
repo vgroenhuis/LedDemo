@@ -74,6 +74,38 @@ int closer_demo_post(const char *path, const char *body, size_t len);
 bool closer_demo_wifi_connected(void);
 const char *closer_demo_version(void);                       // the running firmware version
 
+// ------------------------------------------------------------------ Wi-Fi settings (the /wifi page, closer_wifi_web.h)
+// Saved networks (the provisioned one first), a chosen band or access point, roaming. A change of network, band or
+// access point is tried first: kept (and stored in flash) once the board has an address, otherwise the previous
+// settings come back within a minute. While the network in use can't be found, the board moves on to the next
+// saved network now and then.
+
+#define CLOSER_MAX_NETWORKS 8
+typedef enum { CLOSER_BAND_BOTH, CLOSER_BAND_2G, CLOSER_BAND_5G } closer_band_t;
+typedef struct { bool enabled; int period_s; int weak_rssi; int margin_db; } closer_roam_t;
+typedef struct { char ssid[33]; bool open; } closer_net_t;
+
+int closer_demo_saved_networks(closer_net_t *out, int max);             // returns how many
+// Adds or updates a saved network. password NULL: keep the stored one (an error for a new network).
+esp_err_t closer_demo_wifi_save(const char *ssid, const char *password);
+esp_err_t closer_demo_wifi_forget(const char *ssid);                    // not the one in use
+// To a saved network; bssid NULL or "": any of its access points (channel: a hint, 0 unknown).
+esp_err_t closer_demo_wifi_connect(const char *ssid, const char *bssid, int channel);
+esp_err_t closer_demo_set_band(closer_band_t band);
+closer_band_t closer_demo_get_band(void);
+// The access point the board sticks to ("" none: it picks and roams); pinned ssid is always the network in use.
+const char *closer_demo_pinned_bssid(void);
+esp_err_t closer_demo_unpin(void);
+void closer_demo_get_roam(closer_roam_t *out);
+esp_err_t closer_demo_set_roam(const closer_roam_t *roam);
+// A change being tried right now, and how the last one ended ("Connected to x", "Could not connect to x ...").
+bool closer_demo_wifi_switching(void);
+void closer_demo_wifi_note(char *out, size_t len);
+// The last full scan (closer_demo_scan_all), strongest first; *age_ms: how long ago (-1: none yet).
+int closer_demo_last_scan(wifi_ap_record_t *out, int max, int64_t *age_ms);
+esp_err_t closer_demo_request_scan(void);                               // a full scan in the background
+bool closer_demo_scan_busy(void);
+
 #ifdef __cplusplus
 }
 #endif

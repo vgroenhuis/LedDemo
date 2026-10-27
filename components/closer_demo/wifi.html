@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wi-Fi settings</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#1d232b;--muted:#5b6673;--card:#fff;--line:#dde2e8;--accent:#0b62c4;--ok:#2e9e5b;--warn:#c27a00;--bad:#d23b3b}
+@media(prefers-color-scheme:dark){:root{--bg:#14181d;--fg:#e7ebf0;--muted:#9aa5b1;--card:#1c2128;--line:#2c333c;--accent:#5aa2ff;--ok:#4cc784;--warn:#f0a93a;--bad:#f06a6a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
+main{max-width:640px;margin:0 auto;padding:18px 16px 40px}h1{margin:4px 0 2px;font-size:1.5rem}
+a{color:var(--accent)}.dim{color:var(--muted)}small{color:var(--muted)}
+h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:22px 0 8px;display:flex;align-items:center;gap:8px}
+h2 .sp{flex:1}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+ul{list-style:none;margin:0;padding:0}li{padding:8px 0;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+li:first-child{border-top:0}.grow{flex:1;min-width:0;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center}
+.name{font-weight:600;overflow-wrap:anywhere}.mono{font-family:ui-monospace,monospace;font-size:.85rem}
+.tag{font-size:.75rem;padding:1px 7px;border-radius:9px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.tag.ok{color:var(--ok);border-color:currentColor}.tag.warn{color:var(--warn);border-color:currentColor}
+button{font:inherit;font-size:.85rem;padding:4px 11px;border-radius:7px;border:1px solid var(--accent);background:none;color:var(--accent);cursor:pointer}
+button:hover{background:var(--accent);color:#fff}button:disabled{opacity:.45;pointer-events:none}
+button.primary{background:var(--accent);color:#fff}button.danger{border-color:var(--bad);color:var(--bad)}button.danger:hover{background:var(--bad);color:#fff}
+.seg{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;color:var(--fg);padding:8px 4px}.seg button.on,.seg button:hover{background:var(--accent);color:#fff}
+details{width:100%}summary{cursor:pointer;color:var(--muted);font-size:.85rem}details ul{margin:4px 0 0 12px}
+form{display:grid;gap:8px}input[type=text],input[type=password],input[type=number]{font:inherit;padding:7px 9px;border-radius:7px;border:1px solid var(--line);background:var(--bg);color:var(--fg);width:100%}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}label{display:flex;gap:8px;align-items:center}
+.grid{display:grid;grid-template-columns:1fr 110px;gap:8px 12px;align-items:center}.grid input{width:110px}
+#msg{min-height:1.4em;margin:10px 0 0}#msg.err{color:var(--bad)}
+#status b{font-weight:600}.note{margin-top:6px;font-size:.9rem}
+</style></head><body><main>
+<a href="./" class="dim" style="text-decoration:none">&larr; Back to the demo</a>
+<h1>Wi-Fi settings</h1>
+<div id="ver" class="dim" style="font-size:.85rem;margin-bottom:10px">…</div>
+<div class="card" id="status">Loading ...</div>
+<p id="msg"></p>
+
+<h2>Band</h2>
+<div class="seg" id="band"><button data-b="both">2.4 + 5 GHz</button><button data-b="2g">2.4 GHz only</button><button data-b="5g">5 GHz only</button></div>
+<small>A change is tried first: if the board can't connect within a minute, it goes back to what worked.</small>
+
+<h2>Saved networks</h2>
+<div class="card"><ul id="saved"></ul></div>
+
+<h2>Networks nearby <span class="sp"></span><small id="scanAge"></small><button id="scan">Scan</button></h2>
+<div class="card"><ul id="nearby"></ul></div>
+<small>Open a network's access points to make the board stick to one of them (no roaming while it does).</small>
+
+<h2>Add a network</h2>
+<div class="card"><form id="add" autocomplete="off">
+<input type="text" id="ssid" placeholder="Network name (SSID)" maxlength="32" autocapitalize="off" spellcheck="false">
+<input type="password" id="pw" placeholder="Password (empty for an open network)" maxlength="63">
+<div class="row"><label><input type="checkbox" id="showpw"> Show password</label><span style="flex:1"></span>
+<button type="button" id="saveOnly">Save</button><button type="submit" class="primary">Save and connect</button></div>
+</form></div>
+
+<h2>Roaming</h2>
+<div class="card">
+<p class="dim" style="margin:0 0 8px">Moving to a clearly stronger access point of the same network.</p>
+<div class="grid">
+<label for="rOn">On</label><input type="checkbox" id="rOn" style="width:auto">
+<label for="rPer">Look around every (s, 0: only when the signal is weak)</label><input type="number" id="rPer" min="0" max="86400" step="10">
+<label for="rRssi">Signal counts as weak below (dBm)</label><input type="number" id="rRssi" min="-95" max="-30">
+<label for="rMargin">Move only if the other one is stronger by (dB)</label><input type="number" id="rMargin" min="1" max="40">
+</div>
+<div class="row" style="margin-top:10px"><span id="pinNote" class="dim" style="flex:1"></span><button id="rSave">Save</button></div>
+</div>
+
+<h2>Bluetooth</h2>
+<div class="card"><div class="row"><span id="bt" style="flex:1"></span><button id="btBtn"></button></div>
+<small>Bluetooth and Wi-Fi share one radio. Switching it off (the board restarts) shows how Wi-Fi does on its own.</small></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let S = null, timer = 0;
+const open = new Set();
+const token = () => { try { return localStorage.getItem("labdemosAdminToken") || ""; } catch (e) { return ""; } };
+const band = (ch) => ch > 14 ? "5 GHz" : "2.4 GHz";
+const bars = (r) => "▂▄▆█".slice(0, r > -55 ? 4 : r > -67 ? 3 : r > -75 ? 2 : 1).padEnd(4, "▁");
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function say(t, err) { $("msg").textContent = t || ""; $("msg").className = err ? "err" : ""; }
+
+async function post(body, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  try {
+    const r = await fetch("api/wifi/config", { method: "POST", headers: { "Content-Type": "application/json", "X-Admin-Token": token() }, body: JSON.stringify(body) });
+    if (r.status === 401) { say("Through the lab demos site, Wi-Fi changes need the admin login: log in on the lab demos page first.", true); return; }
+    const j = await r.json().catch(() => ({ ok: r.ok, message: "HTTP " + r.status }));
+    say(j.message, !j.ok);
+  } catch (e) { say("Sent. The page lost the board for now: it may be switching networks.", false); }
+  setTimeout(refresh, 600);
+}
+
+function btn(text, fn, cls) { const b = document.createElement("button"); b.textContent = text; if (cls) b.className = cls; b.onclick = (e) => { e.stopPropagation(); fn(); }; return b; }
+function li(html, ...buttons) { const l = document.createElement("li"); const g = document.createElement("span"); g.className = "grow"; g.innerHTML = html; l.append(g, ...buttons); return l; }
+
+function render(s) {
+  S = s;
+  $("ver").textContent = `Firmware ${s.fw} · ${s.name}`;
+  const nets = new Map();
+  for (const a of s.scan.aps) {
+    if (!a.ssid) continue;
+    const n = nets.get(a.ssid) || { ssid: a.ssid, aps: [], open: a.open, rssi: -127, b24: false, b5: false };
+    n.aps.push(a); n.rssi = Math.max(n.rssi, a.rssi); a.ch > 14 ? (n.b5 = true) : (n.b24 = true);
+    nets.set(a.ssid, n);
+  }
+  const savedSet = new Set(s.saved.map((n) => n.ssid));
+  // status
+  let st = s.connected ? `Connected to <b>${esc(s.ssid)}</b> · <span class="mono">${s.bssid}</span> · ch ${s.channel} (${band(s.channel)}) · ${s.rssi} dBm · ${s.ip}`
+                       : `Not connected · ${esc(s.wifi)} (network ${esc(s.ssid)})`;
+  if (s.pinned) st += `<div class="note">Sticks to access point <span class="mono">${s.pinned}</span>.</div>`;
+  if (s.switching) st += `<div class="note" style="color:var(--warn)">${esc(s.note)} This page may lose the board for up to a minute.</div>`;
+  else if (s.note) st += `<div class="note dim">Last change: ${esc(s.note)}</div>`;
+  $("status").innerHTML = st;
+  // band
+  for (const b of $("band").children) { b.classList.toggle("on", b.dataset.b === s.band); b.disabled = s.switching; }
+  // saved
+  $("saved").replaceChildren(...s.saved.map((n) => {
+    const seen = nets.get(n.ssid), cur = n.ssid === s.ssid;
+    let tags = cur ? `<span class="tag ok">${s.connected ? "in use" : "trying"}</span>` : seen ? `<span class="tag">in range ${bars(seen.rssi)}</span>` : `<span class="tag">not seen</span>`;
+    if (seen) tags += `<span class="tag">${seen.b24 && seen.b5 ? "2.4 + 5 GHz" : seen.b5 ? "5 GHz" : "2.4 GHz"}</span>`;
+    if (n.open) tags += `<span class="tag">open</span>`;
+    const b = [];
+    if (!cur) b.push(btn("Connect", () => post({ action: "connect", ssid: n.ssid }, `Switch the board to "${n.ssid}"? This page may lose it for a moment.`)));
+    if (!cur) b.push(btn("Forget", () => post({ action: "forget", ssid: n.ssid }, `Forget "${n.ssid}"?`), "danger"));
+    b.forEach((x) => (x.disabled = s.switching));
+    return li(`<span class="name">${esc(n.ssid)}</span>${tags}`, ...b);
+  }));
+  // nearby
+  const list = [...nets.values()].sort((a, b) => b.rssi - a.rssi);
+  $("nearby").replaceChildren(...(list.length ? list.map((n) => {
+    const saved = savedSet.has(n.ssid);
+    let tags = `<span class="tag">${bars(n.rssi)} ${n.rssi} dBm</span><span class="tag">${n.b24 && n.b5 ? "2.4 + 5 GHz" : n.b5 ? "5 GHz" : "2.4 GHz"}</span>`;
+    if (!n.open) tags += `<span class="tag">🔒</span>`;
+    if (saved) tags += `<span class="tag ok">saved</span>`;
+    const l = li(`<span class="name">${esc(n.ssid)}</span>${tags}`);
+    if (!saved) { l.style.cursor = "pointer"; l.title = "Add this network"; l.onclick = () => { $("ssid").value = n.ssid; $("pw").value = ""; $("pw").focus(); }; }
+    const d = document.createElement("details");
+    d.open = open.has(n.ssid);
+    d.ontoggle = () => (d.open ? open.add(n.ssid) : open.delete(n.ssid));
+    d.onclick = (e) => e.stopPropagation();
+    d.innerHTML = `<summary>${n.aps.length} access point${n.aps.length > 1 ? "s" : ""}</summary>`;
+    const ul = document.createElement("ul");
+    for (const a of n.aps.sort((x, y) => y.rssi - x.rssi)) {
+      const cur = s.connected && a.bssid === s.bssid, pin = a.bssid === s.pinned;
+      let t = `<span class="mono">${a.bssid}</span><span class="tag">${bars(a.rssi)} ${a.rssi} dBm</span><span class="tag">ch ${a.ch} · ${band(a.ch)}</span>`;
+      if (cur) t += `<span class="tag ok">in use</span>`;
+      if (pin) t += `<span class="tag ok">chosen</span>`;
+      const b = [];
+      if (pin) b.push(btn("Any", () => post({ action: "unpin" })));
+      else if (saved) b.push(btn("Use", () => post({ action: "connect", ssid: n.ssid, bssid: a.bssid, channel: a.ch },
+        `Make the board stick to ${a.bssid} (channel ${a.ch}, ${band(a.ch)})? This page may lose it for a moment.`)));
+      b.forEach((x) => (x.disabled = s.switching));
+      ul.append(li(t, ...b));
+    }
+    d.append(ul);
+    l.append(d);
+    return l;
+  }) : [li(`<span class="dim">${s.scan.busy ? "Scanning ..." : "Nothing yet: press Scan."}</span>`)]));
+  $("scan").disabled = s.scan.busy || !s.connected;
+  $("scan").textContent = s.scan.busy ? "Scanning ..." : "Scan";
+  $("scanAge").textContent = s.scan.age_s >= 0 ? `scanned ${s.scan.age_s < 90 ? s.scan.age_s + " s" : Math.round(s.scan.age_s / 60) + " min"} ago` : "";
+  // roaming (not while someone edits it)
+  if (!$("rSave").parentElement.parentElement.contains(document.activeElement)) {
+    $("rOn").checked = s.roam.enabled; $("rPer").value = s.roam.period_s; $("rRssi").value = s.roam.weak_rssi; $("rMargin").value = s.roam.margin_db;
+  }
+  $("pinNote").innerHTML = s.pinned ? `Off while the board sticks to <span class="mono">${s.pinned}</span>.` : "";
+  // bluetooth
+  const bt = s.bluetooth;
+  $("bt").innerHTML = !bt.available ? "Not in this firmware." : bt.running ? `On · ${bt.clients} connected` : bt.enabled ? "On after the next start" : "Off";
+  $("btBtn").hidden = !bt.available;
+  $("btBtn").textContent = bt.enabled ? "Switch off" : "Switch on";
+  $("btBtn").onclick = () => post({ action: "bluetooth", enabled: !bt.enabled }, `Switch Bluetooth ${bt.enabled ? "off" : "on"}? The board restarts (about 30 s offline).`);
+}
+
+let autoScan = true;      // a fresh list when the page opens (the last scan is missing or over 5 minutes old)
+function refresh() {
+  clearTimeout(timer);
+  fetch("api/wifi/config", { cache: "no-store" }).then((r) => r.json()).then((s) => {
+    render(s);
+    if (autoScan && s.connected && !s.scan.busy && (s.scan.age_s < 0 || s.scan.age_s > 300))
+      fetch("api/wifi/config", { method: "POST", headers: { "Content-Type": "application/json", "X-Admin-Token": token() }, body: '{"action":"scan"}' }).catch(() => {});
+    autoScan = false;
+  })
+    .catch(() => { $("status").textContent = "The page can't reach the board right now (switching networks or restarting?)."; })
+    .finally(() => { timer = setTimeout(refresh, S && (S.switching || S.scan.busy) ? 1500 : 5000); });
+}
+
+for (const b of $("band").children) b.onclick = () => post({ action: "band", band: b.dataset.b }, `Switch the board to ${b.textContent}? This page may lose it for a moment.`);
+$("scan").onclick = () => post({ action: "scan" });
+$("showpw").onchange = () => ($("pw").type = $("showpw").checked ? "text" : "password");
+$("saveOnly").onclick = () => { if ($("ssid").value) post({ action: "save", ssid: $("ssid").value, password: $("pw").value }); };
+$("add").onsubmit = (e) => { e.preventDefault(); if ($("ssid").value) post({ action: "connect", ssid: $("ssid").value, password: $("pw").value }, `Switch the board to "${$("ssid").value}"?`); };
+$("rSave").onclick = () => post({ action: "roam", enabled: $("rOn").checked, period_s: +$("rPer").value, weak_rssi: +$("rRssi").value, margin_db: +$("rMargin").value });
+refresh();
+</script></body></html>

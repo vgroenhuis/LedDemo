@@ -3,11 +3,14 @@
 // Wi-Fi, reporting to the lab demos page and over-the-air updates come from the closer_demo component.
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
 
+#include "closer_ble.h"
 #include "closer_demo.h"
+#include "closer_wifi_web.h"
 #include "driver/gpio.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -467,10 +470,11 @@ static esp_err_t history_get(httpd_req_t *req) {
     return e;
 }
 
-// ------------------------------------------------------------------ access points around (a survey every 30 s)
+// ------------------------------------------------------------------ access points around (a survey while someone looks)
 
 #define SURVEY_MAX 60
-#define SURVEY_EVERY_S 30
+#define SURVEY_GOOD_S 300           // between scans while the signal is good (-65 dBm or better)
+#define SURVEY_WEAK_S 60
 static wifi_ap_record_t survey[SURVEY_MAX];
 static uint16_t survey_n;
 static int64_t survey_ms;            // uptime of the last survey, 0 never
@@ -505,7 +509,9 @@ static int aps_json(char *out, size_t len) {
     return n;
 }
 
+static int64_t aps_asked_ms;         // when the access point list was last asked for (uptime)
 static esp_err_t aps_get(httpd_req_t *req) {
+    aps_asked_ms = esp_timer_get_time() / 1000;
     char *out = malloc(SURVEY_MAX * 150 + 100);
     if (!out) return httpd_resp_send_500(req);
     int n = aps_json(out, SURVEY_MAX * 150 + 100);
@@ -752,11 +758,11 @@ static esp_err_t survey_handler(httpd_req_t *req) {
     return httpd_resp_sendstr(req, out);
 }
 
-// Scans: every SURVEY_EVERY_S while the LED shows the signal or someone watches the stream, and at the survey's
-// interval while a survey runs (a scan delays traffic a little).
+// Scans while someone looks at the access point list (the stream, /api/wifi/aps in the last 2 minutes): every
+// SURVEY_GOOD_S on a good signal, SURVEY_WEAK_S on a weak one; and at the survey's interval while a survey runs.
 static void survey_task(void *arg) {
     static wifi_ap_record_t recs[SURVEY_MAX];
-    int64_t last = -SURVEY_EVERY_S * 1000LL;
+    int64_t last = -SURVEY_GOOD_S * 1000LL;
     bool resume = true;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -768,8 +774,13 @@ static void survey_task(void *arg) {
             ESP_LOGI(TAG, "Survey %lu done: %lu scans", (unsigned long)SV.session, (unsigned long)SV.seq);
         }
         if (SV.backlog_n) sv_flush();
-        int every = SV.active ? SV.interval_s : SURVEY_EVERY_S;
-        bool wanted = SV.active || wifi_mode || stream_has_viewers();
+        // A full scan delays traffic for a few seconds. A board that stands still with a good signal has little to
+        // learn from it: every 5 minutes then, every minute while the signal is weak (a survey session: its own pace).
+        wifi_ap_record_t ap;
+        bool good = esp_wifi_sta_get_ap_info(&ap) == ESP_OK && ap.rssi >= -65;
+        int every = SV.active ? SV.interval_s : good ? SURVEY_GOOD_S : SURVEY_WEAK_S;
+        // Only while someone looks at the list (each full scan delays traffic now and then for a few seconds)
+        bool wanted = SV.active || stream_has_viewers() || (aps_asked_ms && now - aps_asked_ms < 120000);
         if (now - last < every * 1000LL || !wanted || !closer_demo_wifi_connected()) continue;
         uint16_t n = SURVEY_MAX;
         if (closer_demo_scan_all(recs, &n) != ESP_OK) { last = now - (every - 5) * 1000LL; continue; }   // busy: in 5 s
@@ -884,8 +895,23 @@ static esp_err_t led_get(httpd_req_t *req) {
     return httpd_resp_sendstr(req, out);
 }
 
+// What Bluetooth pages see (and get told about at once): kept short, it must fit in one notification.
+static void publish_state(void) {
+    char out[64];
+    snprintf(out, sizeof out, "{\"hex\":\"%02x%02x%02x\",\"brightness\":%d,\"mode\":\"%s\"}", rgb[0], rgb[1], rgb[2],
+             brightness, wifi_mode ? "wifi" : "fixed");
+    closer_ble_set_state(out);
+}
+
+// 0 to 100 (0: the LED is off); -1 if the text isn't a number in that range.
+static int parse_brightness(const char *t) {
+    char *end;
+    long b = strtol(t, &end, 10);
+    return end != t && *end == 0 && b >= 0 && b <= 100 ? (int)b : -1;
+}
+
 // "rrggbb" or "rrggbb,brightness" (a colour: back to the fixed colour), ",brightness" (brightness only),
-// "mode=wifi" or "mode=fixed".
+// "mode=wifi" or "mode=fixed". From the WebSocket and from Bluetooth.
 static void set_from_text(const char *t) {
     unsigned int c;
     int b;
@@ -893,21 +919,24 @@ static void set_from_text(const char *t) {
         wifi_mode = strcmp(t + 5, "wifi") == 0;
         apply_led();
         save_soon();
+        publish_state();
         return;
     }
     if (strlen(t) >= 6 && sscanf(t, "%6x", &c) == 1) { rgb[0] = c >> 16; rgb[1] = c >> 8; rgb[2] = c; wifi_mode = false; }
-    if (t[0] == ',' && (b = atoi(t + 1)) >= 1 && b <= 100) brightness = b;
-    if (strlen(t) > 7 && t[6] == ',' && (b = atoi(t + 7)) >= 1 && b <= 100) brightness = b;
+    if (t[0] == ',' && (b = parse_brightness(t + 1)) >= 0) brightness = b;
+    if (strlen(t) > 7 && t[6] == ',' && (b = parse_brightness(t + 7)) >= 0) brightness = b;
     apply_led();
     led_changes++;
     save_soon();
+    publish_state();
 }
 
 // WebSocket: the page sends "rrggbb,brightness" for every slider step; no reply, no new connection, no flash write.
+// "ping:<anything>" comes back as "pong:<anything>" (the Bluetooth page compares round trips with Bluetooth's).
 static esp_err_t ws_handler(httpd_req_t *req) {
     if (req->method == HTTP_GET) { touch(req); return ESP_OK; }      // the handshake
     httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT};
-    char buf[32];
+    char buf[48];
     frame.payload = (uint8_t *)buf;
     esp_err_t err = httpd_ws_recv_frame(req, &frame, sizeof buf - 1);
     if (err != ESP_OK) return err;
@@ -915,7 +944,10 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         buf[frame.len] = 0;
         touch_client(req);
         if (strcmp(buf, "stream") == 0) stream_add(httpd_req_to_sockfd(req));
-        else set_from_text(buf);
+        else if (strncmp(buf, "ping:", 5) == 0) {
+            buf[1] = 'o';
+            return httpd_ws_send_frame(req, &frame);
+        } else set_from_text(buf);
     }
     return ESP_OK;
 }
@@ -930,13 +962,14 @@ static esp_err_t led_post(httpd_req_t *req) {
         }
         if (httpd_query_key_value(q, "mode", v, sizeof v) == ESP_OK) wifi_mode = strcmp(v, "wifi") == 0;
         if (httpd_query_key_value(q, "brightness", v, sizeof v) == ESP_OK) {
-            int b = atoi(v);
-            if (b >= 1 && b <= 100) brightness = b;
+            int b = parse_brightness(v);
+            if (b >= 0) brightness = b;
         }
     }
     apply_led();
     save_soon();
     led_changes++;
+    publish_state();
     return httpd_resp_sendstr(req, "ok");
 }
 
@@ -944,7 +977,7 @@ static void web_start(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
-    cfg.max_uri_handlers = 14;
+    cfg.max_uri_handlers = 16;       // (12 in use: 9 here, 3 for the Wi-Fi settings page)
     cfg.send_wait_timeout = 2;       // a stalled viewer must not hold the others up for long
     httpd_handle_t srv;
     ESP_ERROR_CHECK(httpd_start(&srv, &cfg));
@@ -961,6 +994,7 @@ static void web_start(void) {
         {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
     };
     for (int i = 0; i < sizeof uris / sizeof uris[0]; i++) httpd_register_uri_handler(srv, &uris[i]);
+    closer_wifi_web_register(srv);   // since 1.14.0: /wifi, networks, band, access point, roaming, Bluetooth on/off
 }
 
 void app_main(void) {
@@ -981,6 +1015,8 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(150));
     }
     web_start();
+    publish_state();
+    closer_ble_start("turtle", set_from_text);     // since 1.13.0: the LED from a phone or laptop nearby, over Bluetooth
     xTaskCreate(led_task, "led", 4096, NULL, 4, NULL);
     survey_lock = xSemaphoreCreateMutex();
     xTaskCreate(wifi_task, "wifi-live", 4096, NULL, 3, NULL);

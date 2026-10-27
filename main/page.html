@@ -25,7 +25,7 @@ td:first-child{width:26px}.lamp{display:inline-block;width:14px;height:14px;bord
 @keyframes blink{50%{opacity:0}}@keyframes breathe{0%,100%{opacity:.1}50%{opacity:1}}
 @keyframes dbl{0%,6%{opacity:1}6.1%,15%{opacity:.2}15.1%,21%{opacity:1}21.1%,100%{opacity:.2}}@keyframes flash{0%,10%{opacity:1}10.1%,100%{opacity:.2}}
 </style></head><body><main>
-<h1>Turtle</h1><p>Set the colour of the on-board LED, or let it show the Wi-Fi signal.</p>
+<h1>Turtle</h1><div id="ver" style="color:var(--muted);font-size:.85rem">…</div><p>Set the colour of the on-board LED, or let it show the Wi-Fi signal.</p>
 <div class="card">
 <div class="modes"><button id="mFixed">Fixed colour</button><button id="mWifi">Wi-Fi signal</button></div>
 <div id="sw"></div>
@@ -54,10 +54,11 @@ td:first-child{width:26px}.lamp{display:inline-block;width:14px;height:14px;bord
 </table>
 </div>
 <label for="br">Brightness <span id="bv"></span></label>
-<input id="br" type="range" min="1" max="100" value="25">
+<input id="br" type="range" min="0" max="100" value="25">
 <button class="off" id="off">Turn off</button>
 </div>
-<small id="info">…</small>
+<small><a href="wifi" style="color:var(--accent)">Wi-Fi settings</a>: networks, band, access point, roaming, Bluetooth</small>
+<small><a href="https://closer.ram.eemcs.utwente.nl/labdemos/apps/turtle/bluetooth.html" target="_blank" rel="noopener" style="color:var(--accent)">Control over Bluetooth</a>: Chrome or Edge; installable, then it works without internet</small>
 </main>
 <script>
 const $=id=>document.getElementById(id);let t;
@@ -99,6 +100,6 @@ function poll(){fetch('api/wifi',{cache:'no-store'}).then(r=>r.json()).then(w=>{
   b.onclick=()=>{$('col').value=c;send();};$('pre').appendChild(b);});
 setMode('fixed',false);
 fetch('api/led').then(r=>r.json()).then(s=>{const hex='#'+s.hex;$('col').value=hex==='#000000'?'#00a0ff':hex;$('br').value=s.brightness;
-  show(hex==='#000000'?'var(--bg)':hex,s.brightness);if(s.mode==='wifi')setMode('wifi',false);$('info').textContent='Firmware '+s.fw+' · '+s.host;
+  show(hex==='#000000'?'var(--bg)':hex,s.brightness);if(s.mode==='wifi')setMode('wifi',false);$('ver').textContent='Firmware '+s.fw+' · '+s.host;
   if(s.host&&s.host!=='turtle'){const t=s.host.replace(/^./,c=>c.toUpperCase());document.title=t;document.querySelector('h1').textContent=t;}}).catch(()=>{});
 </script></body></html>

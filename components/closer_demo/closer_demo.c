@@ -1,4 +1,5 @@
 #include "closer_demo.h"
+#include "closer_ble.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -46,6 +47,8 @@ static struct {
     bool booted_reported;       // the "boot" event has reached the server
     bool pending_verify;        // running a freshly installed image that hasn't proved itself yet
     char failed_version[32];    // a version that was rolled back; not tried again
+    int64_t retry_ota_us;       // after a failed download: not before this (uptime)
+    int ota_tries;
     bool ota_busy;
     bool roam_pending;          // connecting to a chosen access point
     int roam_fail, roams;
@@ -53,9 +56,22 @@ static struct {
     int channel, attempts;
     closer_wifi_phase_t phase;
     bool ever_connected;
+    int last_channel;       // of the last connection (a quick reconnect tries it first)
     int64_t down_since_us;      // when the connection was lost (or start-up); 0 while connected
     TaskHandle_t reporter;
+    closer_band_t band;
+    char pin_bssid[18];         // the chosen access point of the network in use ("" any)
+    int pin_channel;
+    bool switching;             // closer_demo_wifi_connect() & co are trying something
+    bool unsaved;               // moved to another saved network by itself: store it once connected
+    char switch_note[112];
+    closer_roam_t roam;
 } S = {.clients = -1, .wifi = "Starting Wi-Fi"};
+
+// Saved networks (NVS namespace "closer_nets", blobs n0..n7); passwords never leave the board.
+typedef struct { char ssid[33]; char pass[65]; } saved_net_t;
+static saved_net_t nets[CLOSER_MAX_NETWORKS];
+static int nets_n;
 
 // ------------------------------------------------------------------ flash settings
 
@@ -66,7 +82,48 @@ static void get_setting(nvs_handle_t h, const char *key, char *out, size_t len, 
     }
 }
 
+static void load_nets(void) {
+    nets_n = 0;
+    nvs_handle_t h;
+    if (nvs_open("closer_nets", NVS_READONLY, &h) == ESP_OK) {
+        for (int i = 0; i < CLOSER_MAX_NETWORKS; i++) {
+            char key[4] = {'n', '0' + i, 0};
+            size_t n = sizeof nets[0];
+            if (nvs_get_blob(h, key, &nets[nets_n], &n) == ESP_OK && n == sizeof nets[0] && nets[nets_n].ssid[0]) nets_n++;
+        }
+        nvs_close(h);
+    }
+}
+
+static void store_nets(void) {
+    nvs_handle_t h;
+    if (nvs_open("closer_nets", NVS_READWRITE, &h) != ESP_OK) return;
+    for (int i = 0; i < CLOSER_MAX_NETWORKS; i++) {
+        char key[4] = {'n', '0' + i, 0};
+        if (i < nets_n) nvs_set_blob(h, key, &nets[i], sizeof nets[i]);
+        else nvs_erase_key(h, key);
+    }
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static int find_net(const char *ssid) {
+    for (int i = 0; i < nets_n; i++)
+        if (strcmp(nets[i].ssid, ssid) == 0) return i;
+    return -1;
+}
+
 static void load_settings(void) {
+#if CONFIG_CLOSER_WIFI_BAND_5G
+    S.band = CLOSER_BAND_5G;
+#elif CONFIG_CLOSER_WIFI_BAND_2G
+    S.band = CLOSER_BAND_2G;
+#endif
+#ifdef CONFIG_CLOSER_ROAMING
+    S.roam.enabled = true;
+#endif
+    S.roam = (closer_roam_t){.enabled = S.roam.enabled, .period_s = CONFIG_CLOSER_ROAM_PERIODIC_S,
+                             .weak_rssi = CONFIG_CLOSER_ROAM_RSSI, .margin_db = CONFIG_CLOSER_ROAM_MARGIN};
     nvs_handle_t h;
     if (nvs_open("closer", NVS_READONLY, &h) == ESP_OK) {
         get_setting(h, "wifi_ssid", S.ssid, sizeof S.ssid, CONFIG_CLOSER_DEFAULT_SSID);
@@ -74,6 +131,14 @@ static void load_settings(void) {
         get_setting(h, "base_url", S.base, sizeof S.base, CONFIG_CLOSER_REPORT_URL);
         get_setting(h, "key", S.key, sizeof S.key, CONFIG_CLOSER_DEFAULT_KEY);
         get_setting(h, "failed_ver", S.failed_version, sizeof S.failed_version, "");
+        get_setting(h, "pin_bssid", S.pin_bssid, sizeof S.pin_bssid, "");
+        int32_t v;
+        if (nvs_get_i32(h, "pin_ch", &v) == ESP_OK) S.pin_channel = v;
+        if (nvs_get_i32(h, "band", &v) == ESP_OK && v >= CLOSER_BAND_BOTH && v <= CLOSER_BAND_5G) S.band = v;
+        if (nvs_get_i32(h, "roam_on", &v) == ESP_OK) S.roam.enabled = v;
+        if (nvs_get_i32(h, "roam_per", &v) == ESP_OK) S.roam.period_s = v;
+        if (nvs_get_i32(h, "roam_rssi", &v) == ESP_OK) S.roam.weak_rssi = v;
+        if (nvs_get_i32(h, "roam_margin", &v) == ESP_OK) S.roam.margin_db = v;
         nvs_close(h);
     } else {
         strlcpy(S.ssid, CONFIG_CLOSER_DEFAULT_SSID, sizeof S.ssid);
@@ -189,6 +254,59 @@ static void clear_target(void) {
     S.roam_pending = false;
 }
 
+static void set_band(closer_band_t b) {
+    wifi_band_mode_t m = b == CLOSER_BAND_2G ? WIFI_BAND_MODE_2G_ONLY : b == CLOSER_BAND_5G ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_AUTO;
+    if (esp_wifi_set_band_mode(m) != ESP_OK) ESP_LOGW(TAG, "could not set the Wi-Fi band");
+}
+
+static bool parse_bssid(const char *t, uint8_t out[6]) {
+    unsigned int b[6];
+    if (!t || sscanf(t, "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
+    for (int i = 0; i < 6; i++) out[i] = b[i];
+    return true;
+}
+
+// The station settings for S.ssid / S.password / the chosen access point.
+static void make_config(wifi_config_t *wc) {
+    memset(wc, 0, sizeof *wc);
+    strlcpy((char *)wc->sta.ssid, S.ssid, sizeof wc->sta.ssid);
+    strlcpy((char *)wc->sta.password, S.password, sizeof wc->sta.password);
+    wc->sta.threshold.authmode = S.password[0] ? WIFI_AUTH_WPA_WPA2_PSK : WIFI_AUTH_OPEN;
+    wc->sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wc->sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    if (S.pin_bssid[0] && parse_bssid(S.pin_bssid, wc->sta.bssid)) {
+        wc->sta.bssid_set = true;
+        wc->sta.channel = S.pin_channel;
+    }
+}
+
+// Joins S.ssid & co afresh (from the Wi-Fi event task or another task).
+static void reconnect_now(void) {
+    wifi_config_t wc;
+    make_config(&wc);
+    S.roam_pending = false;
+    S.last_channel = 0;
+    S.attempts = 0;
+    bool was = closer_demo_wifi_connected();
+    xEventGroupClearBits(S.events, WIFI_CONNECTED_BIT);
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    esp_wifi_disconnect();           // the event handler connects again, with these settings
+    if (!was) esp_wifi_connect();    // (no "disconnected" event while it wasn't connected)
+}
+
+static void save_active(void) {
+    nvs_handle_t h;
+    if (nvs_open("closer", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, "wifi_ssid", S.ssid);
+    nvs_set_str(h, "wifi_pass", S.password);
+    nvs_set_str(h, "pin_bssid", S.pin_bssid);
+    nvs_set_i32(h, "pin_ch", S.pin_channel);
+    nvs_set_i32(h, "band", S.band);
+    nvs_commit(h);
+    nvs_close(h);
+    S.unsaved = false;
+}
+
 static void set_wifi_state(const char *fmt, ...) {
     char text[48];
     va_list ap;
@@ -221,18 +339,14 @@ static const char *reason_text(int r) {
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
         wifi_event_sta_connected_t *e = data;
-        S.channel = e->channel;
+        S.channel = S.last_channel = e->channel;
         S.phase = CLOSER_WIFI_GETTING_IP;
         set_wifi_state("Getting an address");
         return;
     }
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         // The band can only be set once Wi-Fi is started, so it is done here, right before the first connect.
-#if CONFIG_CLOSER_WIFI_BAND_5G
-        if (esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY) != ESP_OK) ESP_LOGW(TAG, "could not limit Wi-Fi to 5 GHz");
-#elif CONFIG_CLOSER_WIFI_BAND_2G
-        if (esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY) != ESP_OK) ESP_LOGW(TAG, "could not limit Wi-Fi to 2.4 GHz");
-#endif
+        if (S.band != CLOSER_BAND_BOTH) set_band(S.band);
         S.attempts = 1;
         S.phase = CLOSER_WIFI_SEARCHING;
         S.down_since_us = esp_timer_get_time();
@@ -255,6 +369,39 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             ESP_LOGW(TAG, "Roaming target unreachable");
             clear_target();
         }
+        if (!S.roam_pending && !S.switching && S.attempts >= 4 && S.pin_bssid[0]) {
+            // The chosen access point isn't there: any of the network will do (the choice comes back after a restart).
+            ESP_LOGW(TAG, "Chosen access point %s not found, taking any", S.pin_bssid);
+            S.pin_bssid[0] = 0;
+            wifi_config_t wc;
+            make_config(&wc);
+            esp_wifi_set_config(WIFI_IF_STA, &wc);
+        }
+        if (!S.roam_pending && !S.switching && nets_n > 1 && S.attempts % 6 == 0) {
+            // The network in use can't be joined (out of range?): the next saved one, in turn.
+            int i = find_net(S.ssid);
+            const saved_net_t *n = &nets[(i + 1) % nets_n];
+            ESP_LOGW(TAG, "Trying saved network %s instead of %s", n->ssid, S.ssid);
+            strlcpy(S.ssid, n->ssid, sizeof S.ssid);
+            strlcpy(S.password, n->pass, sizeof S.password);
+            S.pin_bssid[0] = 0;
+            S.last_channel = 0;
+            S.unsaved = true;
+            wifi_config_t wc;
+            make_config(&wc);
+            esp_wifi_set_config(WIFI_IF_STA, &wc);
+        }
+        if (!S.roam_pending && !S.switching) {
+            // A working connection was lost: try its channel first (well under a second) before scanning all
+            // channels again (about 20 s with Bluetooth on, as it then shares the radio).
+            wifi_config_t wc;
+            if (esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK) {
+                bool quick = S.ever_connected && S.last_channel && S.attempts <= 2;
+                wc.sta.channel = quick ? S.last_channel : 0;
+                wc.sta.scan_method = quick ? WIFI_FAST_SCAN : WIFI_ALL_CHANNEL_SCAN;
+                esp_wifi_set_config(WIFI_IF_STA, &wc);
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_wifi_connect();      // (the "try N" note stays up while it searches again)
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -268,6 +415,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         set_wifi_state("Connected");
         xEventGroupSetBits(S.events, WIFI_CONNECTED_BIT);
         if (S.roam_pending) clear_target();
+        if (S.unsaved && !S.switching) save_active();      // (moved to another saved network by itself)
     }
 }
 
@@ -280,12 +428,8 @@ static void wifi_start(void) {
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
-    wifi_config_t wc = {0};
-    strlcpy((char *)wc.sta.ssid, S.ssid, sizeof wc.sta.ssid);
-    strlcpy((char *)wc.sta.password, S.password, sizeof wc.sta.password);
-    wc.sta.threshold.authmode = S.password[0] ? WIFI_AUTH_WPA_WPA2_PSK : WIFI_AUTH_OPEN;
-    wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-    wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    wifi_config_t wc;
+    make_config(&wc);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
@@ -299,6 +443,14 @@ static void wifi_start(void) {
 // with one network name that can be a poor one, and a moving demo drifts away from it. So: look around shortly after
 // connecting, when the signal is weak, and now and then; move to another access point of the same network only
 // if it is clearly stronger. What was seen is reported (stats alt_rssi, roams) so the page shows how well it works.
+// Listening time per channel. While Bluetooth runs (closer_ble) the Wi-Fi driver refuses scans with their own active
+// times ("Should use default active scan time parameter ... when Bluetooth is enabled"), so they get the driver's
+// defaults then. Otherwise short visits, and on the 5 GHz radar channels (52-144, where the board may only listen)
+// 120 ms instead of the driver's 360 ms: just over one beacon interval (102 ms), holding traffic up a third as long.
+static wifi_scan_time_t scan_time(void) {
+    if (closer_ble_running()) return (wifi_scan_time_t){0};
+    return (wifi_scan_time_t){.active = {.min = 20, .max = CONFIG_CLOSER_ROAM_SCAN_CHANNEL_MS}, .passive = 120};
+}
 static volatile bool roam_hold;
 static int roam_scans;
 void closer_demo_roaming_hold(bool hold) { roam_hold = hold; }
@@ -306,8 +458,7 @@ void closer_demo_roaming_hold(bool hold) { roam_hold = hold; }
 // Returns true if it started moving to another access point.
 static bool roam_scan(const wifi_ap_record_t *cur) {
     wifi_scan_config_t sc = {.ssid = (uint8_t *)S.ssid, .show_hidden = false, .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-                             .scan_time = {.active = {.min = 20, .max = CONFIG_CLOSER_ROAM_SCAN_CHANNEL_MS}},
-                             .home_chan_dwell_time = CONFIG_CLOSER_ROAM_SCAN_DWELL_MS};
+                             .scan_time = scan_time(), .home_chan_dwell_time = CONFIG_CLOSER_ROAM_SCAN_DWELL_MS};
     closer_demo_set_stat("roam_scans", ++roam_scans);
     S.phase = CLOSER_WIFI_SCANNING;
     set_wifi_state("Looking for a better AP");
@@ -328,7 +479,7 @@ static bool roam_scan(const wifi_ap_record_t *cur) {
         if (best < 0 || recs[i].rssi > recs[best].rssi) best = i;
     }
     closer_demo_set_stat("alt_rssi", best >= 0 ? recs[best].rssi : -100);       // strongest other access point seen
-    if (best >= 0 && recs[best].rssi >= cur->rssi + CONFIG_CLOSER_ROAM_MARGIN) {
+    if (best >= 0 && recs[best].rssi >= cur->rssi + S.roam.margin_db) {
         ESP_LOGI(TAG, "Roaming: %d dBm -> %d dBm (channel %d -> %d)", cur->rssi, recs[best].rssi, cur->primary, recs[best].primary);
         wifi_config_t wc;
         if (esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK) {
@@ -351,17 +502,29 @@ static bool roam_scan(const wifi_ap_record_t *cur) {
 }
 
 static SemaphoreHandle_t scan_lock;      // one scan at a time (roaming or survey)
+#define SCAN_CACHE 40
+static wifi_ap_record_t scan_cache[SCAN_CACHE];         // the last full scan, for the Wi-Fi settings page
+static int scan_cache_n;
+static int64_t scan_cache_us;
+static volatile bool scan_busy;
 
 esp_err_t closer_demo_scan_all(wifi_ap_record_t *out, uint16_t *n) {
     if (!closer_demo_wifi_connected() || !scan_lock || xSemaphoreTake(scan_lock, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
     wifi_scan_config_t sc = {.show_hidden = false, .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-                             .scan_time = {.active = {.min = 20, .max = CONFIG_CLOSER_ROAM_SCAN_CHANNEL_MS}},
-                             .home_chan_dwell_time = CONFIG_CLOSER_ROAM_SCAN_DWELL_MS};
+                             .scan_time = scan_time(), .home_chan_dwell_time = CONFIG_CLOSER_ROAM_SCAN_DWELL_MS};
     S.phase = CLOSER_WIFI_SCANNING;
     esp_err_t e = esp_wifi_scan_start(&sc, true);
     if (S.phase == CLOSER_WIFI_SCANNING) S.phase = CLOSER_WIFI_CONNECTED;
     if (e == ESP_OK) e = esp_wifi_scan_get_ap_records(n, out);       // (sorted by signal; frees the rest)
     else *n = 0;
+    if (e == ESP_OK) {
+        int k = *n < SCAN_CACHE ? *n : SCAN_CACHE;
+        xSemaphoreTake(S.lock, portMAX_DELAY);
+        memcpy(scan_cache, out, k * sizeof *out);
+        scan_cache_n = k;
+        scan_cache_us = esp_timer_get_time();
+        xSemaphoreGive(S.lock);
+    }
     xSemaphoreGive(scan_lock);
     return e;
 }
@@ -374,10 +537,13 @@ static void roam_task(void *arg) {
     bool first = CONFIG_CLOSER_ROAM_INITIAL_SCAN;
     for (;;) {
         wifi_ap_record_t cur;
-        if (!roam_hold && closer_demo_wifi_connected() && esp_wifi_sta_get_ap_info(&cur) == ESP_OK) {
+        // (not while switched off, while an access point is chosen, or while another network is being tried)
+        if (S.roam.enabled && !S.pin_bssid[0] && !S.switching && !roam_hold && closer_demo_wifi_connected() &&
+            esp_wifi_sta_get_ap_info(&cur) == ESP_OK) {
             int64_t now = esp_timer_get_time() / 1000000;
-            bool periodic = CONFIG_CLOSER_ROAM_PERIODIC_S > 0 && now - last_scan >= CONFIG_CLOSER_ROAM_PERIODIC_S;
-            bool weak = cur.rssi < CONFIG_CLOSER_ROAM_RSSI && now - last_scan >= weak_wait;
+            bool periodic = S.roam.period_s > 0 && now - last_scan >= S.roam.period_s;
+            bool weak = cur.rssi < S.roam.weak_rssi && now - last_scan >= weak_wait;
+            if (first && cur.rssi >= S.roam.weak_rssi + 10) first = false;      // a strong signal: no need to look around
             if ((first || periodic || weak) && xSemaphoreTake(scan_lock, pdMS_TO_TICKS(20000)) == pdTRUE) {
                 bool moved = roam_scan(&cur);
                 xSemaphoreGive(scan_lock);
@@ -491,51 +657,77 @@ static void ota_task(void *arg) {
     const esp_partition_t *slot = esp_ota_get_next_update_partition(NULL);
     esp_ota_handle_t ota = 0;
     esp_http_client_config_t cfg = {.url = url, .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 15000, .buffer_size = 2048};
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
     bool ok = false;
     psa_hash_operation_t sha = PSA_HASH_OPERATION_INIT;
     bool sha_ok = psa_crypto_init() == PSA_SUCCESS && psa_hash_setup(&sha, PSA_ALG_SHA_256) == PSA_SUCCESS;
     char *buf = malloc(4096);
-    if (c && slot && buf && sha_ok) {
-        set_auth(c);
-        if (esp_http_client_open(c, 0) == ESP_OK) {
-            int total = esp_http_client_fetch_headers(c);
-            int status = esp_http_client_get_status_code(c);
-            if (status == 200 && total > 0 && (size == 0 || total == size) && esp_ota_begin(slot, total, &ota) == ESP_OK) {
-                int got = 0, n;
-                ok = true;
-                while ((n = esp_http_client_read(c, buf, 4096)) > 0) {
-                    if (psa_hash_update(&sha, (uint8_t *)buf, n) != PSA_SUCCESS) { ok = false; break; }
-                    if (esp_ota_write(ota, buf, n) != ESP_OK) { ok = false; break; }
-                    got += n;
-                }
-                ok = ok && got == total;
-                uint8_t digest[32];
-                char dh[65];
-                size_t dlen = 0;
-                if (psa_hash_finish(&sha, digest, sizeof digest, &dlen) != PSA_SUCCESS || dlen != 32) ok = false;
-                hex(digest, 32, dh);
-                if (ok && strcasecmp(dh, want_sha) != 0) { ESP_LOGE(TAG, "SHA-256 mismatch"); ok = false; }
-                if (ok && esp_ota_end(ota) != ESP_OK) ok = false;
-                else if (!ok) esp_ota_abort(ota);
-                if (ok && esp_ota_set_boot_partition(slot) != ESP_OK) ok = false;
-            } else {
-                ESP_LOGE(TAG, "Download refused: status %d, length %d", status, total);
+    if (slot && buf && sha_ok) {
+        // Where the Wi-Fi is poor a download can stall: it then continues where it broke off (HTTP Range), up to
+        // 8 connections, instead of starting over.
+        int total = 0, got = 0;
+        bool begun = false, broken = false;
+        for (int attempt = 0; attempt < 8 && !broken && (!begun || got < total); attempt++) {
+            if (attempt) vTaskDelay(pdMS_TO_TICKS(3000));
+            esp_http_client_handle_t c = esp_http_client_init(&cfg);
+            if (!c) break;
+            set_auth(c);
+            char range[32];
+            if (got) {
+                snprintf(range, sizeof range, "bytes=%d-", got);
+                esp_http_client_set_header(c, "Range", range);
             }
+            if (esp_http_client_open(c, 0) == ESP_OK) {
+                int len = esp_http_client_fetch_headers(c);
+                int status = esp_http_client_get_status_code(c);
+                if (!begun) {
+                    if (status == 200 && len > 0 && (size == 0 || len == size) && esp_ota_begin(slot, len, &ota) == ESP_OK) {
+                        total = len;
+                        begun = true;
+                    } else {
+                        ESP_LOGE(TAG, "Download refused: status %d, length %d", status, len);
+                        broken = true;
+                    }
+                } else if (status != 206 || len != total - got) {
+                    ESP_LOGE(TAG, "Can't resume the download: status %d, length %d", status, len);
+                    broken = true;
+                }
+                int n;
+                while (!broken && (n = esp_http_client_read(c, buf, 4096)) > 0) {
+                    if (psa_hash_update(&sha, (uint8_t *)buf, n) != PSA_SUCCESS || esp_ota_write(ota, buf, n) != ESP_OK) broken = true;
+                    else got += n;
+                }
+            }
+            esp_http_client_close(c);
+            esp_http_client_cleanup(c);
+            if (begun && !broken && got < total) ESP_LOGW(TAG, "Download broke off at %d of %d bytes; resuming", got, total);
         }
+        ok = begun && !broken && got == total;
+        uint8_t digest[32];
+        char dh[65];
+        size_t dlen = 0;
+        if (psa_hash_finish(&sha, digest, sizeof digest, &dlen) != PSA_SUCCESS || dlen != 32) ok = false;
+        hex(digest, 32, dh);
+        if (ok && strcasecmp(dh, want_sha) != 0) { ESP_LOGE(TAG, "SHA-256 mismatch"); ok = false; }
+        if (ok && esp_ota_end(ota) != ESP_OK) ok = false;
+        else if (!ok && begun) esp_ota_abort(ota);
+        if (ok && esp_ota_set_boot_partition(slot) != ESP_OK) ok = false;
     }
     psa_hash_abort(&sha);
     free(buf);
-    if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
     if (ok) {
         ESP_LOGI(TAG, "Update installed, restarting");
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
     }
-    ESP_LOGE(TAG, "Update to %s failed; staying on %s", version, S.version);
-    remember_failed_version(version);               // not retried until a different version is released
-    strlcpy(S.failed_version, version, sizeof S.failed_version);
-    closer_demo_set_message("update failed");
+    // A download that broke off (Wi-Fi hiccup) is no reason to give up on the version: again in 5, 10, 20 ...
+    // minutes (up to an hour). Only a version that was installed and then rolled back is never tried again.
+    S.ota_tries++;
+    int wait_min = S.ota_tries >= 4 ? 60 : 5 << (S.ota_tries - 1);
+    S.retry_ota_us = esp_timer_get_time() + wait_min * 60 * 1000000LL;
+    ESP_LOGE(TAG, "Update to %s failed; staying on %s, trying again in %d min", version, S.version, wait_min);
+    char m[64];
+    snprintf(m, sizeof m, "update to %s failed (download), again in %d min", version, wait_min);
+    closer_demo_set_message(m);
     cJSON_Delete(u);
     S.ota_busy = false;
     vTaskDelete(NULL);
@@ -547,6 +739,7 @@ static void maybe_update(cJSON *reply) {
     cJSON *v = cJSON_GetObjectItem(u, "version"), *p = cJSON_GetObjectItem(u, "path"), *h = cJSON_GetObjectItem(u, "sha256");
     if (!cJSON_IsString(v) || !cJSON_IsString(p) || !cJSON_IsString(h)) return;
     if (strcmp(v->valuestring, S.version) == 0 || strcmp(v->valuestring, S.failed_version) == 0) return;
+    if (S.retry_ota_us && esp_timer_get_time() < S.retry_ota_us) return;
     cJSON *copy = cJSON_Duplicate(u, true);
     S.ota_busy = true;
     if (xTaskCreate(ota_task, "ota", 8192, copy, 5, NULL) != pdPASS) { cJSON_Delete(copy); S.ota_busy = false; }
@@ -612,6 +805,11 @@ static void report_task(void *arg) {
                 esp_ota_mark_app_valid_cancel_rollback();
                 S.pending_verify = false;
                 ESP_LOGI(TAG, "Firmware %s confirmed", S.version);
+                if (S.failed_version[0]) {                 // an older failure is history now
+                    remember_failed_version("");
+                    S.failed_version[0] = 0;
+                    closer_demo_set_message("");
+                }
             }
         }
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(S.pending_verify ? 15000 : CONFIG_CLOSER_INTERVAL_S * 1000));
@@ -642,6 +840,14 @@ esp_err_t closer_demo_start(const char *hostname) {
     S.events = xEventGroupCreate();
     strlcpy(S.version, esp_app_get_description()->version, sizeof S.version);
     load_settings();
+    load_nets();
+    if (S.ssid[0] && find_net(S.ssid) < 0 && nets_n < CLOSER_MAX_NETWORKS) {    // the provisioned network: saved too
+        memmove(&nets[1], &nets[0], nets_n * sizeof nets[0]);
+        strlcpy(nets[0].ssid, S.ssid, sizeof nets[0].ssid);
+        strlcpy(nets[0].pass, S.password, sizeof nets[0].pass);
+        nets_n++;
+        store_nets();
+    }
     // The name: given, or the demo id at the front of the device key ("turtle-2.<secret>"), so one firmware serves
     // several boards.
     if (hostname && hostname[0]) strlcpy(S.hostname, hostname, sizeof S.hostname);
@@ -666,8 +872,227 @@ esp_err_t closer_demo_start(const char *hostname) {
     ESP_LOGI(TAG, "Firmware %s%s", S.version, S.pending_verify ? " (new, unconfirmed)" : "");
     wifi_start();
     xTaskCreate(report_task, "report", 8192, NULL, 4, &S.reporter);
-#if CONFIG_CLOSER_ROAMING
-    xTaskCreate(roam_task, "roam", 4096, NULL, 3, NULL);
-#endif
+    xTaskCreate(roam_task, "roam", 4096, NULL, 3, NULL);      // (does nothing while roaming is switched off)
     return ESP_OK;
 }
+
+// ------------------------------------------------------------------ Wi-Fi settings (closer_demo.h)
+
+#define SWITCH_WAIT_S 60        // a scan of all channels takes ~20 s with Bluetooth on; then joining, an address
+
+static void note(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (S.lock) xSemaphoreTake(S.lock, portMAX_DELAY);
+    vsnprintf(S.switch_note, sizeof S.switch_note, fmt, ap);
+    if (S.lock) xSemaphoreGive(S.lock);
+    va_end(ap);
+    ESP_LOGI(TAG, "%s", S.switch_note);
+}
+
+typedef struct { char ssid[33], pass[65], bssid[18]; int channel; closer_band_t band; } choice_t;
+static choice_t switch_to;
+
+static void current_choice(choice_t *c) {
+    strlcpy(c->ssid, S.ssid, sizeof c->ssid);
+    strlcpy(c->pass, S.password, sizeof c->pass);
+    strlcpy(c->bssid, S.pin_bssid, sizeof c->bssid);
+    c->channel = S.pin_channel;
+    c->band = S.band;
+}
+
+static void apply_choice(const choice_t *c) {
+    strlcpy(S.ssid, c->ssid, sizeof S.ssid);
+    strlcpy(S.password, c->pass, sizeof S.password);
+    strlcpy(S.pin_bssid, c->bssid, sizeof S.pin_bssid);
+    S.pin_channel = c->bssid[0] ? c->channel : 0;
+    S.band = c->band;
+    set_band(c->band);
+    reconnect_now();
+}
+
+static const char *band_name(closer_band_t b) { return b == CLOSER_BAND_2G ? "2.4 GHz" : b == CLOSER_BAND_5G ? "5 GHz" : "2.4 + 5 GHz"; }
+
+static void describe(const choice_t *c, char *out, size_t len) {
+    snprintf(out, len, "%s%s%s%s%s", c->ssid, c->bssid[0] ? " via " : "", c->bssid, c->band != CLOSER_BAND_BOTH ? ", " : "",
+             c->band != CLOSER_BAND_BOTH ? band_name(c->band) : "");
+}
+
+// Tries switch_to; keeps it once connected (stored in flash), else back to what worked before.
+static void switch_task(void *arg) {
+    choice_t prev, want = switch_to;
+    current_choice(&prev);
+    char what[96], before[96];
+    describe(&want, what, sizeof what);
+    describe(&prev, before, sizeof before);
+    note("Trying %s ...", what);
+    apply_choice(&want);
+    vTaskDelay(pdMS_TO_TICKS(500));      // (the old connection's bit is cleared; wait for a new address)
+    EventBits_t bits = xEventGroupWaitBits(S.events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(SWITCH_WAIT_S * 1000));
+    if (bits & WIFI_CONNECTED_BIT) {
+        save_active();
+        note("Connected to %s", what);
+    } else {
+        char why[48];
+        xSemaphoreTake(S.lock, portMAX_DELAY);
+        strlcpy(why, S.wifi, sizeof why);
+        xSemaphoreGive(S.lock);
+        apply_choice(&prev);
+        note("Could not connect to %s (%s); back on %s", what, why, before);
+    }
+    S.switching = false;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t start_switch(const choice_t *c) {
+    if (S.switching) return ESP_ERR_INVALID_STATE;
+    S.switching = true;
+    switch_to = *c;
+    if (xTaskCreate(switch_task, "wifi_switch", 4096, NULL, 4, NULL) != pdPASS) {
+        S.switching = false;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+int closer_demo_saved_networks(closer_net_t *out, int max) {
+    int n = 0;
+    xSemaphoreTake(S.lock, portMAX_DELAY);
+    for (int i = 0; i < nets_n && n < max; i++, n++) {
+        strlcpy(out[n].ssid, nets[i].ssid, sizeof out[n].ssid);
+        out[n].open = !nets[i].pass[0];
+    }
+    xSemaphoreGive(S.lock);
+    return n;
+}
+
+esp_err_t closer_demo_wifi_save(const char *ssid, const char *password) {
+    if (!ssid || !ssid[0] || strlen(ssid) > 32 || (password && strlen(password) > 64)) return ESP_ERR_INVALID_ARG;
+    if (password && password[0] && strlen(password) < 8) return ESP_ERR_INVALID_SIZE;      // WPA2: 8 to 63 characters
+    esp_err_t err = ESP_OK;
+    xSemaphoreTake(S.lock, portMAX_DELAY);
+    int i = find_net(ssid);
+    if (i < 0 && !password) err = ESP_ERR_NOT_FOUND;
+    else if (i < 0 && nets_n >= CLOSER_MAX_NETWORKS) err = ESP_ERR_NO_MEM;
+    else {
+        if (i < 0) {
+            i = nets_n++;
+            strlcpy(nets[i].ssid, ssid, sizeof nets[i].ssid);
+        }
+        if (password) strlcpy(nets[i].pass, password, sizeof nets[i].pass);
+        store_nets();
+    }
+    xSemaphoreGive(S.lock);
+    return err;
+}
+
+esp_err_t closer_demo_wifi_forget(const char *ssid) {
+    if (!ssid || strcmp(ssid, S.ssid) == 0) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(S.lock, portMAX_DELAY);
+    int i = find_net(ssid);
+    if (i >= 0) {
+        memmove(&nets[i], &nets[i + 1], (nets_n - i - 1) * sizeof nets[0]);
+        nets_n--;
+        store_nets();
+    }
+    xSemaphoreGive(S.lock);
+    return i >= 0 ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t closer_demo_wifi_connect(const char *ssid, const char *bssid, int channel) {
+    choice_t c;
+    current_choice(&c);
+    xSemaphoreTake(S.lock, portMAX_DELAY);
+    int i = find_net(ssid ? ssid : "");
+    if (i >= 0) {
+        strlcpy(c.ssid, nets[i].ssid, sizeof c.ssid);
+        strlcpy(c.pass, nets[i].pass, sizeof c.pass);
+    }
+    xSemaphoreGive(S.lock);
+    if (i < 0) return ESP_ERR_NOT_FOUND;
+    uint8_t b[6];
+    if (bssid && bssid[0] && !parse_bssid(bssid, b)) return ESP_ERR_INVALID_ARG;
+    strlcpy(c.bssid, bssid ? bssid : "", sizeof c.bssid);
+    c.channel = channel;
+    return start_switch(&c);
+}
+
+esp_err_t closer_demo_set_band(closer_band_t band) {
+    if (band < CLOSER_BAND_BOTH || band > CLOSER_BAND_5G) return ESP_ERR_INVALID_ARG;
+    choice_t c;
+    current_choice(&c);
+    c.band = band;
+    if (band != CLOSER_BAND_BOTH && c.channel) {      // a chosen access point on the other band can't stay chosen
+        bool five = c.channel > 14;
+        if (five != (band == CLOSER_BAND_5G)) { c.bssid[0] = 0; c.channel = 0; }
+    }
+    return start_switch(&c);
+}
+
+closer_band_t closer_demo_get_band(void) { return S.band; }
+const char *closer_demo_pinned_bssid(void) { return S.pin_bssid; }
+
+esp_err_t closer_demo_unpin(void) {
+    if (S.switching) return ESP_ERR_INVALID_STATE;
+    S.pin_bssid[0] = 0;
+    S.pin_channel = 0;
+    wifi_config_t wc;
+    make_config(&wc);
+    esp_wifi_set_config(WIFI_IF_STA, &wc);       // (stays on the access point it is on; roaming may move it later)
+    save_active();
+    note("Any access point of %s", S.ssid);
+    return ESP_OK;
+}
+
+void closer_demo_get_roam(closer_roam_t *out) { *out = S.roam; }
+
+esp_err_t closer_demo_set_roam(const closer_roam_t *r) {
+    if (r->period_s < 0 || r->period_s > 86400 || r->weak_rssi < -95 || r->weak_rssi > -30 || r->margin_db < 1 || r->margin_db > 40)
+        return ESP_ERR_INVALID_ARG;
+    S.roam = *r;
+    nvs_handle_t h;
+    if (nvs_open("closer", NVS_READWRITE, &h) != ESP_OK) return ESP_FAIL;
+    nvs_set_i32(h, "roam_on", r->enabled);
+    nvs_set_i32(h, "roam_per", r->period_s);
+    nvs_set_i32(h, "roam_rssi", r->weak_rssi);
+    nvs_set_i32(h, "roam_margin", r->margin_db);
+    nvs_commit(h);
+    nvs_close(h);
+    return ESP_OK;
+}
+
+bool closer_demo_wifi_switching(void) { return S.switching; }
+
+void closer_demo_wifi_note(char *out, size_t len) {
+    xSemaphoreTake(S.lock, portMAX_DELAY);
+    strlcpy(out, S.switch_note, len);
+    xSemaphoreGive(S.lock);
+}
+
+int closer_demo_last_scan(wifi_ap_record_t *out, int max, int64_t *age_ms) {
+    xSemaphoreTake(S.lock, portMAX_DELAY);
+    int n = scan_cache_n < max ? scan_cache_n : max;
+    memcpy(out, scan_cache, n * sizeof *out);
+    *age_ms = scan_cache_us ? (esp_timer_get_time() - scan_cache_us) / 1000 : -1;
+    xSemaphoreGive(S.lock);
+    return n;
+}
+
+static void scan_task(void *arg) {
+    wifi_ap_record_t *recs = malloc(SCAN_CACHE * sizeof *recs);
+    uint16_t n = SCAN_CACHE;
+    if (recs) closer_demo_scan_all(recs, &n);
+    free(recs);
+    scan_busy = false;
+    vTaskDelete(NULL);
+}
+
+esp_err_t closer_demo_request_scan(void) {
+    if (!closer_demo_wifi_connected()) return ESP_ERR_INVALID_STATE;
+    if (scan_busy) return ESP_OK;
+    scan_busy = true;
+    if (xTaskCreate(scan_task, "wifi_scan", 3072, NULL, 2, NULL) != pdPASS) { scan_busy = false; return ESP_ERR_NO_MEM; }
+    return ESP_OK;
+}
+
+bool closer_demo_scan_busy(void) { return scan_busy; }
