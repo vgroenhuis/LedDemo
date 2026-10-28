@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UDP test</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#1d232b;--muted:#5b6673;--card:#fff;--line:#dde2e8;--accent:#0b62c4;--ok:#2e9e5b;--warn:#c27a00;--bad:#d23b3b}
+@media(prefers-color-scheme:dark){:root{--bg:#14181d;--fg:#e7ebf0;--muted:#9aa5b1;--card:#1c2128;--line:#2c333c;--accent:#5aa2ff;--ok:#4cc784;--warn:#f0a93a;--bad:#f06a6a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
+main{max-width:720px;margin:0 auto;padding:18px 16px 40px}h1{margin:4px 0 2px;font-size:1.5rem}
+a{color:var(--accent)}.dim{color:var(--muted)}small{color:var(--muted)}
+h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:22px 0 8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+button{font:inherit;font-size:.85rem;padding:5px 12px;border-radius:7px;border:1px solid var(--accent);background:none;color:var(--accent);cursor:pointer}
+button:hover{background:var(--accent);color:#fff}button:disabled{opacity:.45;pointer-events:none}
+button.primary{background:var(--accent);color:#fff}
+.seg{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;color:var(--fg);padding:8px 4px;font-size:.82rem}.seg button.on,.seg button:hover{background:var(--accent);color:#fff}
+@media(max-width:520px){.seg{grid-template-columns:repeat(2,1fr)}}
+input{font:inherit;padding:6px 8px;border-radius:7px;border:1px solid var(--line);background:var(--bg);color:var(--fg);width:100%}
+.form{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px 12px;margin-top:10px}
+.form label{display:grid;gap:3px;font-size:.82rem;color:var(--muted)}.form .wide{grid-column:span 2}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+#msg{min-height:1.4em;margin:8px 0 0}#msg.err{color:var(--bad)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:8px}
+.tile{border:1px solid var(--line);border-radius:9px;padding:6px 9px}.tile b{display:block;font-size:1.15rem;font-variant-numeric:tabular-nums}
+.tile span{font-size:.75rem;color:var(--muted)}.bad b{color:var(--bad)}.good b{color:var(--ok)}
+canvas{width:100%;height:220px;display:block;margin-top:10px}
+.note{font-size:.88rem;margin:8px 0 0}
+</style></head><body><main>
+<a href="./" class="dim" style="text-decoration:none">&larr; Back to the demo</a>
+<h1>UDP test</h1>
+<div id="ver" class="dim" style="font-size:.85rem;margin-bottom:10px">…</div>
+
+<h2>What to measure</h2>
+<div class="seg" id="mode">
+<button data-m="echo">Board → CloSer</button><button data-m="server">CloSer → board</button>
+<button data-m="ntp">NTP server</button><button data-m="other">Other echo</button></div>
+<p class="note dim" id="explain"></p>
+<div class="card">
+<div class="form">
+<label class="wide">Host<input id="host" autocapitalize="off" spellcheck="false"></label>
+<label>Port<input id="port" type="number" min="1" max="65535"></label>
+<label>Packets<input id="count" type="number" min="1" max="5000"></label>
+<label>Every (ms)<input id="interval" type="number" min="10" max="10000"></label>
+<label>Size (bytes)<input id="size" type="number" min="24" max="1400"></label>
+</div>
+<div class="row"><button class="primary" id="start">Start</button><button id="stop" disabled>Stop</button>
+<span class="dim" id="plan" style="font-size:.85rem"></span></div>
+<p id="msg"></p>
+</div>
+
+<h2>Result</h2>
+<div class="card">
+<div id="status" class="dim">No test yet.</div>
+<div class="tiles" style="margin-top:10px">
+<div class="tile"><b id="tSent">–</b><span>sent</span></div>
+<div class="tile"><b id="tBack">–</b><span>came back</span></div>
+<div class="tile" id="lossTile"><b id="tLoss">–</b><span>lost</span></div>
+<div class="tile"><b id="tMin">–</b><span>min (ms)</span></div>
+<div class="tile"><b id="tMed">–</b><span>median (ms)</span></div>
+<div class="tile"><b id="tAvg">–</b><span>average (ms)</span></div>
+<div class="tile"><b id="tP95">–</b><span>95% within (ms)</span></div>
+<div class="tile"><b id="tMax">–</b><span>max (ms)</span></div>
+<div class="tile"><b id="tJit">–</b><span>jitter (ms)</span></div>
+</div>
+<p class="note" id="detail"></p>
+<canvas id="plot"></canvas>
+<div class="row"><small style="flex:1">Each dot is one packet's round trip; red marks at the bottom are packets that never came back.</small>
+<button id="csv" disabled>Download CSV</button></div>
+</div>
+
+<h2>About</h2>
+<p class="note dim">UDP sends single packets: nothing is retried or kept in order, unlike the WebSocket (TCP) the demo page uses.
+A lost packet is simply gone, and a late one doesn't hold up the next. Round trip = there and back again.
+The echo counts what it receives, so a lost packet can be told apart: lost on the way out or on the way back.</p>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const viaSite = location.pathname.includes("/device/");
+const PRESETS = {
+  echo: {host: "closer.ram.eemcs.utwente.nl", port: 8131, count: 200, interval: 50, size: 64,
+    text: "The board sends to the CloSer server's UDP echo (port 8131). Needs UDP from the board's network to reach the server."},
+  server: {count: 200, interval: 50, size: 64,
+    text: "The CloSer server sends to the board's own UDP echo (port 8131) and measures. Needs the server to reach the board: a university network, not a home router."},
+  ntp: {host: "ntp.utwente.nl", port: 123, count: 5, interval: 8000, size: 48,
+    text: "The board asks a time server: any NTP server answers. A check that UDP gets out at all. At most 10 requests, one per 8 s: time servers ignore clients that ask more often."},
+  other: {host: "", port: 8131, count: 200, interval: 50, size: 64,
+    text: "Any echo of these test packets: another board (its address, port 8131) or a computer running labdemos/udp_echo.py."},
+};
+let mode = "echo", name = "", run = null, rtts = [], timer = null;
+
+function msg(t, err) { $("msg").textContent = t || ""; $("msg").className = err ? "err" : ""; }
+function serverApi(p) { return `../../api/udp/${encodeURIComponent(name)}${p}`; }
+function api(p) { return mode === "server" ? serverApi(p) : `api/udp${p}`; }
+
+function setMode(m, fill = true) {
+  mode = m;
+  document.querySelectorAll("#mode button").forEach((b) => b.classList.toggle("on", b.dataset.m === m));
+  const p = PRESETS[m];
+  $("explain").textContent = p.text + (m === "server" && !viaSite ? " Open this page through the lab demos site for this one." : "");
+  if (fill) for (const k of ["host", "port", "count", "interval", "size"]) if (p[k] !== undefined) $(k).value = p[k];
+  if (m === "server") $("host").value = "(this board)";
+  $("host").disabled = m === "server";
+  $("port").disabled = m === "server";
+  $("size").disabled = m === "ntp";
+  $("start").disabled = (m === "server" && !viaSite) || (run && run.state === "running");
+  plan();
+}
+
+function plan() {
+  const n = +$("count").value, iv = +$("interval").value, sz = +$("size").value;
+  const kbit = (sz + 28) * 8 / iv;          // (+ IP and UDP headers)
+  $("plan").textContent = n && iv ? `takes ${fmtDur(n * iv / 1000)}, ${kbit < 1000 ? kbit.toFixed(0) + " kbit/s" : (kbit / 1000).toFixed(1) + " Mbit/s"} each way` : "";
+}
+function fmtDur(s) { return s < 90 ? `${Math.round(s)} s` : `${(s / 60).toFixed(1)} min`; }
+["count", "interval", "size"].forEach((k) => $(k).addEventListener("input", plan));
+document.querySelectorAll("#mode button").forEach((b) => b.onclick = () => setMode(b.dataset.m));
+
+async function post(body) {
+  const r = await fetch(api(""), {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  let j = {};
+  try { j = await r.json(); } catch (e) { j = {ok: false, message: `HTTP ${r.status}`}; }
+  if (!r.ok && !j.message) j.message = j.detail || `HTTP ${r.status}`;
+  return j;
+}
+
+$("start").onclick = async () => {
+  const body = {action: "start", mode: mode === "other" ? "echo" : mode, host: $("host").value.trim(), port: +$("port").value,
+                count: +$("count").value, interval_ms: +$("interval").value, size: +$("size").value};
+  msg("Starting …");
+  try {
+    const j = await post(body);
+    msg(j.message, !j.ok);
+    if (j.ok) { rtts = []; run = null; poll(); }
+  } catch (e) { msg("The board or the server didn't answer", true); }
+};
+$("stop").onclick = async () => { try { msg((await post({action: "stop"})).message); } catch (e) {} };
+
+// Round trips come in pieces; a packet's reply can still arrive later, so the last few seconds are asked again.
+async function fetchRun() {
+  let from = rtts.length;
+  if (run) {
+    const back = Math.ceil(8000 / run.interval_ms) + 1;
+    for (let i = Math.max(0, rtts.length - back); i < rtts.length; i++) if (rtts[i] < 0) { from = i; break; }
+  }
+  for (let guard = 0; guard < 10; guard++) {
+    const r = await fetch(api(`?from=${from}`), {cache: "no-store"});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    if (!run || j.from === 0 && from === 0) rtts = [];
+    rtts.length = Math.min(rtts.length, j.from);
+    rtts.push(...j.rtt);
+    run = j;
+    from = rtts.length;
+    if (from >= j.sent) return j;
+  }
+  return run;
+}
+
+async function poll() {
+  clearTimeout(timer);
+  try {
+    const j = await fetchRun();
+    if (!name && j.name) name = j.name;
+    if (j.fw) $("ver").textContent = `${j.name} · firmware ${j.fw}`;
+    show(j);
+    if (j.state === "running") timer = setTimeout(poll, 700);
+  } catch (e) {
+    msg("Can't reach " + (mode === "server" ? "the server" : "the board") + " (" + e.message + ")", true);
+    timer = setTimeout(poll, 3000);
+  }
+}
+
+function pct(sorted, p) { return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : NaN; }
+function ms(v) { return isNaN(v) ? "–" : v < 10 ? v.toFixed(1) : v.toFixed(0); }
+
+function show(j) {
+  const running = j.state === "running";
+  $("start").disabled = running || (mode === "server" && !viaSite);
+  $("stop").disabled = !running;
+  $("csv").disabled = !rtts.length;
+  if (j.state === "idle") { $("status").textContent = "No test yet."; return; }
+  const what = j.mode === "server" ? `CloSer → ${j.host}` : j.mode === "ntp" ? `NTP ${j.host}` : `${j.host}${j.ip && j.ip !== j.host ? " (" + j.ip + ")" : ""}:${j.port}`;
+  $("status").textContent = `${j.message} · ${what} · ${j.count} × ${j.size} bytes every ${j.interval_ms} ms · ${fmtDur(j.elapsed_ms / 1000)}`;
+  const settled = running ? Math.max(0, j.sent - Math.ceil(1500 / j.interval_ms)) : j.sent;   // (still on its way: not lost yet)
+  const got = rtts.filter((v) => v >= 0).map((v) => v / 10);
+  let lost = 0;
+  for (let i = 0; i < settled; i++) if (!(rtts[i] >= 0)) lost++;
+  const sorted = [...got].sort((a, b) => a - b);
+  let jit = 0, pairs = 0, prev = null;
+  for (const v of rtts) { if (v >= 0) { if (prev !== null) { jit += Math.abs(v - prev) / 10; pairs++; } prev = v; } }
+  $("tSent").textContent = j.sent;
+  $("tBack").textContent = j.received;
+  $("tLoss").textContent = settled ? `${(100 * lost / settled).toFixed(lost && lost * 1000 < settled ? 2 : 1)}%` : "–";
+  $("lossTile").className = "tile " + (!settled ? "" : lost ? "bad" : "good");
+  $("tMin").textContent = ms(sorted[0]);
+  $("tMed").textContent = ms(pct(sorted, .5));
+  $("tAvg").textContent = ms(got.length ? got.reduce((a, b) => a + b, 0) / got.length : NaN);
+  $("tP95").textContent = ms(pct(sorted, .95));
+  $("tMax").textContent = ms(sorted[sorted.length - 1]);
+  $("tJit").textContent = ms(pairs ? jit / pairs : NaN);
+  const d = [];
+  if (j.peer_rx >= 0 && !running && j.sent) {
+    const echo = j.mode === "server" ? "The board" : "The echo";
+    d.push(`${echo} received ${j.peer_rx} of ${j.sent}: ${j.sent - j.peer_rx} lost on the way there, ${Math.max(0, j.peer_rx - j.received)} on the way back.`);
+  }
+  if (j.dup) d.push(`${j.dup} duplicated.`);
+  if (j.reorder) d.push(`${j.reorder} came back out of order.`);
+  if (j.send_err) d.push(`${j.send_err} couldn't be sent (Wi-Fi busy or down).`);
+  if (j.wifi) d.push(`Board's Wi-Fi at the start: ${j.wifi.rssi} dBm, channel ${j.wifi.channel}${j.wifi.channel > 14 ? " (5 GHz)" : " (2.4 GHz)"}, Bluetooth ${j.wifi.bluetooth ? "on" : "off"}.`);
+  $("detail").textContent = d.join(" ");
+  draw(settled, sorted);
+}
+
+function draw(settled, sorted) {
+  const c = $("plot"), dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext("2d");
+  g.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement), col = (v) => css.getPropertyValue(v).trim();
+  const L = 40, B = 18, T = 6, n = Math.max(rtts.length, run ? run.count : 1);
+  const top = Math.max(2, pct(sorted, .99) * 1.25 || 2), nice = niceMax(top);
+  g.font = "11px system-ui"; g.fillStyle = col("--muted"); g.strokeStyle = col("--line"); g.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) {
+    const y = T + (h - T - B) * (1 - k / 4);
+    g.beginPath(); g.moveTo(L, y); g.lineTo(w, y); g.stroke();
+    g.fillText(`${+(nice * k / 4).toFixed(1)}`, 2, y + 4);
+  }
+  g.fillText("ms", 2, T + 10 + (h - T - B) / 8);
+  const x = (i) => L + (w - L - 4) * (i + .5) / n;
+  for (let i = 0; i < rtts.length; i++) {
+    const v = rtts[i];
+    if (v >= 0) {
+      const over = v / 10 > nice;
+      g.fillStyle = over ? col("--warn") : col("--accent");
+      g.fillRect(x(i) - 1.5, (over ? T : T + (h - T - B) * (1 - v / 10 / nice)) - 1.5, 3, 3);
+    } else if (i < settled) {
+      g.fillStyle = col("--bad"); g.fillRect(x(i) - 1, h - B + 3, 2, 8);
+    }
+  }
+}
+function niceMax(v) { const e = 10 ** Math.floor(Math.log10(v)); return [1, 2, 2.5, 5, 10].map((m) => m * e).find((m) => m >= v); }
+
+$("csv").onclick = () => {
+  const j = run || {};
+  const lines = [`# ${j.name} ${j.mode} ${j.host}:${j.port} count ${j.count} interval_ms ${j.interval_ms} size ${j.size} ${new Date().toISOString()}`,
+                 "seq,rtt_ms"];
+  rtts.forEach((v, i) => lines.push(`${i},${v >= 0 ? (v / 10).toFixed(1) : ""}`));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n") + "\n"], {type: "text/csv"}));
+  a.download = `udp-${j.name || "board"}-${j.mode || ""}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}.csv`;
+  a.click();
+};
+window.addEventListener("resize", () => run && show(run));
+
+setMode("echo");
+(async () => {
+  try {                   // the board's last test (and its name, for the server's tests)
+    const j = await (await fetch("api/udp?from=0", {cache: "no-store"})).json();
+    name = j.name; $("ver").textContent = `${j.name} · firmware ${j.fw}`;
+    if (viaSite) {        // a test the server is running for this board is shown instead
+      try {
+        const s = await (await fetch(serverApi("?from=0"), {cache: "no-store"})).json();
+        if (s.state === "running" || (s.state !== "idle" && j.state === "idle")) { setMode("server"); rtts = s.rtt; run = s; show(s); if (s.state === "running") poll(); return; }
+      } catch (e) {}
+    }
+    if (j.state !== "idle") {
+      setMode(j.mode === "ntp" ? "ntp" : j.host === PRESETS.echo.host ? "echo" : "other", false);
+      for (const [k, v] of [["host", j.host], ["port", j.port], ["count", j.count], ["interval", j.interval_ms], ["size", j.size]]) $(k).value = v;
+      plan();
+      rtts = j.rtt; run = j; show(j);
+      if (j.state === "running") poll();
+    }
+  } catch (e) { msg("Can't reach the board", true); }
+})();
+</script>
+</body></html>

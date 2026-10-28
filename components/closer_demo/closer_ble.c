@@ -7,6 +7,9 @@
 esp_err_t closer_ble_start(const char *app, closer_ble_command_cb on_command) { return ESP_ERR_NOT_SUPPORTED; }
 void closer_ble_set_state(const char *text) {}
 int closer_ble_connections(void) { return 0; }
+void closer_ble_set_conn_handlers(closer_ble_conn_command_cb on_command, closer_ble_disconnect_cb on_disconnect) {}
+void closer_ble_notify(int conn, const char *text) {}
+int closer_ble_conn_handles(int *out, int max) { return 0; }
 bool closer_ble_enabled(void) { return false; }
 esp_err_t closer_ble_set_enabled(bool on) { return ESP_ERR_NOT_SUPPORTED; }
 bool closer_ble_running(void) { return false; }
@@ -39,6 +42,10 @@ static const ble_uuid128_t info_uuid = CLOSER_UUID(0x05);
 #define MAX_CMD 64
 
 static closer_ble_command_cb command_cb;
+static closer_ble_conn_command_cb conn_command_cb;
+static closer_ble_disconnect_cb disconnect_cb;
+static int handles[CONFIG_BT_NIMBLE_MAX_CONNECTIONS];
+static portMUX_TYPE handles_lock = portMUX_INITIALIZER_UNLOCKED;
 static char app_name[24];
 static char state[161];
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -84,7 +91,8 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
     if (ble_hs_mbuf_to_flat(ctxt->om, buf, MAX_CMD, &len) != 0) return BLE_ATT_ERR_UNLIKELY;
     buf[len] = 0;
     commands++;
-    if (command_cb) command_cb(buf);
+    if (conn_command_cb) conn_command_cb(conn, buf);
+    else if (command_cb) command_cb(buf);
     return 0;
 }
 
@@ -115,6 +123,10 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             conns++;
+            taskENTER_CRITICAL(&handles_lock);
+            for (int i = 0; i < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++)
+                if (handles[i] < 0) { handles[i] = event->connect.conn_handle; break; }
+            taskEXIT_CRITICAL(&handles_lock);
             count_changed();
             // Ask for short connection intervals (7.5 to 15 ms): commands then wait at most that long for their turn.
             // The phone or laptop decides; many settle on 15 to 30 ms.
@@ -126,6 +138,11 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
         if (conns > 0) conns--;
+        taskENTER_CRITICAL(&handles_lock);
+        for (int i = 0; i < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++)
+            if (handles[i] == event->disconnect.conn.conn_handle) handles[i] = -1;
+        taskEXIT_CRITICAL(&handles_lock);
+        if (disconnect_cb) disconnect_cb(event->disconnect.conn.conn_handle);
         count_changed();
         advertise();
         return 0;
@@ -213,6 +230,7 @@ esp_err_t closer_ble_start(const char *app, closer_ble_command_cb on_command) {
         return ESP_OK;
     }
     command_cb = on_command;
+    for (int i = 0; i < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++) handles[i] = -1;
     snprintf(app_name, sizeof app_name, "%s", app ? app : "");
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
@@ -245,5 +263,25 @@ void closer_ble_set_state(const char *text) {
 }
 
 int closer_ble_connections(void) { return conns; }
+
+void closer_ble_set_conn_handlers(closer_ble_conn_command_cb on_command, closer_ble_disconnect_cb on_disconnect) {
+    conn_command_cb = on_command;
+    disconnect_cb = on_disconnect;
+}
+
+void closer_ble_notify(int conn, const char *text) {
+    if (!running || !state_handle) return;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(text, strlen(text));
+    if (om) ble_gatts_notify_custom(conn, state_handle, om);     // (it frees om, also when it fails)
+}
+
+int closer_ble_conn_handles(int *out, int max) {
+    int n = 0;
+    taskENTER_CRITICAL(&handles_lock);
+    for (int i = 0; i < CONFIG_BT_NIMBLE_MAX_CONNECTIONS && n < max; i++)
+        if (handles[i] >= 0) out[n++] = handles[i];
+    taskEXIT_CRITICAL(&handles_lock);
+    return n;
+}
 
 #endif

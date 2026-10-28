@@ -11,6 +11,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
@@ -537,8 +538,11 @@ static void roam_task(void *arg) {
     bool first = CONFIG_CLOSER_ROAM_INITIAL_SCAN;
     for (;;) {
         wifi_ap_record_t cur;
-        // (not while switched off, while an access point is chosen, or while another network is being tried)
-        if (S.roam.enabled && !S.pin_bssid[0] && !S.switching && !roam_hold && closer_demo_wifi_connected() &&
+        // (not while switched off, while an access point is chosen, or while another network is being tried; nor while
+        // someone is connected over Bluetooth: with Bluetooth on, a scan holds the one radio for seconds, and the
+        // Bluetooth connection, there because the Wi-Fi is poor, would stall)
+        if (S.roam.enabled && !S.pin_bssid[0] && !S.switching && !roam_hold && closer_ble_connections() == 0 &&
+            closer_demo_wifi_connected() &&
             esp_wifi_sta_get_ap_info(&cur) == ESP_OK) {
             int64_t now = esp_timer_get_time() / 1000000;
             bool periodic = S.roam.period_s > 0 && now - last_scan >= S.roam.period_s;
@@ -621,7 +625,9 @@ static char *build_report(const char *event) {
         cJSON_AddStringToObject(j, "bssid", b);
         cJSON_AddNumberToObject(j, "channel", ap.primary);
     }
-    cJSON_AddNumberToObject(j, "heap_free", esp_get_free_heap_size());
+    // Internal RAM (what Wi-Fi, Bluetooth and the tasks need); PSRAM, where a board has it, as the stat psram_free.
+    cJSON_AddNumberToObject(j, "heap_free", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM)) closer_demo_set_stat("psram_free", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     cJSON_AddNumberToObject(j, "interval", CONFIG_CLOSER_INTERVAL_S);
     if (S.clients >= 0) cJSON_AddNumberToObject(j, "clients", S.clients);
     xSemaphoreTake(S.lock, portMAX_DELAY);
@@ -736,6 +742,7 @@ static void ota_task(void *arg) {
 static void maybe_update(cJSON *reply) {
     cJSON *u = cJSON_GetObjectItem(reply, "update");
     if (!cJSON_IsObject(u) || S.ota_busy || S.pending_verify) return;
+    if (roam_hold) return;          // a time-critical moment (a robot being driven): the next report offers it again
     cJSON *v = cJSON_GetObjectItem(u, "version"), *p = cJSON_GetObjectItem(u, "path"), *h = cJSON_GetObjectItem(u, "sha256");
     if (!cJSON_IsString(v) || !cJSON_IsString(p) || !cJSON_IsString(h)) return;
     if (strcmp(v->valuestring, S.version) == 0 || strcmp(v->valuestring, S.failed_version) == 0) return;

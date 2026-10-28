@@ -23,3 +23,6 @@ CONFIG_BT_NIMBLE_SECURITY_ENABLE=n
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
 # Log and console on the USB port of the C5 itself (as in 1.12.0 and before)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# UDP test (closer_udp: two UDP sockets next to the web server, heartbeats and updates)
+CONFIG_LWIP_MAX_SOCKETS=16

@@ -10,6 +10,7 @@
 
 #include "closer_ble.h"
 #include "closer_demo.h"
+#include "closer_udp.h"
 #include "closer_wifi_web.h"
 #include "driver/gpio.h"
 #include "esp_http_server.h"
@@ -977,7 +978,7 @@ static void web_start(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
-    cfg.max_uri_handlers = 16;       // (12 in use: 9 here, 3 for the Wi-Fi settings page)
+    cfg.max_uri_handlers = 16;       // (15 in use: 9 here, 3 for the Wi-Fi settings page, 3 for the UDP test)
     cfg.send_wait_timeout = 2;       // a stalled viewer must not hold the others up for long
     httpd_handle_t srv;
     ESP_ERROR_CHECK(httpd_start(&srv, &cfg));
@@ -995,6 +996,7 @@ static void web_start(void) {
     };
     for (int i = 0; i < sizeof uris / sizeof uris[0]; i++) httpd_register_uri_handler(srv, &uris[i]);
     closer_wifi_web_register(srv);   // since 1.14.0: /wifi, networks, band, access point, roaming, Bluetooth on/off
+    closer_udp_register(srv);        // since 1.15.0: /udp, round trips to the CloSer server (and the board's own echo)
 }
 
 void app_main(void) {
