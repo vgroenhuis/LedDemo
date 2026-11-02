@@ -775,17 +775,18 @@ static void survey_task(void *arg) {
             ESP_LOGI(TAG, "Survey %lu done: %lu scans", (unsigned long)SV.session, (unsigned long)SV.seq);
         }
         if (SV.backlog_n) sv_flush();
-        // A full scan delays traffic for a few seconds. A board that stands still with a good signal has little to
-        // learn from it: every 5 minutes then, every minute while the signal is weak (a survey session: its own pace).
+        // A full scan (one channel at a time since 1.16.0) still delays traffic a little now and then. A board that
+        // stands still with a good signal has little to learn from it: every 5 minutes then, every minute while the
+        // signal is weak (a survey session: its own pace).
         wifi_ap_record_t ap;
         bool good = esp_wifi_sta_get_ap_info(&ap) == ESP_OK && ap.rssi >= -65;
         int every = SV.active ? SV.interval_s : good ? SURVEY_GOOD_S : SURVEY_WEAK_S;
-        // Only while someone looks at the list (each full scan delays traffic now and then for a few seconds)
+        // Only while someone looks at the list
         bool wanted = SV.active || stream_has_viewers() || (aps_asked_ms && now - aps_asked_ms < 120000);
         if (now - last < every * 1000LL || !wanted || !closer_demo_wifi_connected()) continue;
         uint16_t n = SURVEY_MAX;
         if (closer_demo_scan_all(recs, &n) != ESP_OK) { last = now - (every - 5) * 1000LL; continue; }   // busy: in 5 s
-        last = now;                                   // (the interval runs from start to start: a full scan takes ~10 s)
+        last = now;                                   // (the interval runs from start to start: a full scan takes ~20 s)
         xSemaphoreTake(survey_lock, portMAX_DELAY);
         memcpy(survey, recs, n * sizeof recs[0]);
         survey_n = n;

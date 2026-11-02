@@ -27,8 +27,9 @@ void closer_demo_set_stat(const char *name, float value);   // name: [a-z][a-z0-
 void closer_demo_set_clients(int n);
 void closer_demo_set_message(const char *text);              // short note on the demo page (max 120 characters)
 
-// Time-critical moments: no roaming scans while held (scans briefly interrupt traffic). Call with true before
-// the critical part and false after it; a scan that was due then happens later.
+// Time-critical moments (a robot being driven): no Wi-Fi scans while held, and a scan under way stops (each
+// channel visit briefly interrupts traffic). Call with true before the critical part and false after it; a scan that
+// was due then happens later.
 void closer_demo_roaming_hold(bool hold);
 
 // What Wi-Fi is doing, for a status light (closer_demo_status_t.phase).
@@ -62,8 +63,8 @@ typedef struct {
 } closer_demo_status_t;
 void closer_demo_get_status(closer_demo_status_t *out);
 
-// A survey: scans all channels for every network (gently, like the roaming scans: traffic is delayed, not dropped)
-// and fills up to *n records, strongest first; *n becomes the number filled. Only while connected.
+// A survey: scans all channels for every network, one channel at a time 0.4 s apart (~20 s; traffic is delayed by a
+// tenth of a second now and then, the board stays reachable) and fills up to *n records, strongest first; *n becomes the number filled. Only while connected.
 // ESP_ERR_INVALID_STATE while not connected or while another scan runs.
 esp_err_t closer_demo_scan_all(wifi_ap_record_t *out, uint16_t *n);
 
@@ -73,6 +74,12 @@ int closer_demo_post(const char *path, const char *body, size_t len);
 
 bool closer_demo_wifi_connected(void);
 const char *closer_demo_version(void);                       // the running firmware version
+// "Check for updates" (e.g. a button on the demo's own page): reports to the site now; a download that broke off is
+// tried again at once. closer_demo_update_json: {"version","checking","installing","offered": a newer version the
+// site offers ("": none),"checked_s": seconds since the site's last answer (-1: none yet),"note"}.
+void closer_demo_check_update(void);
+int closer_demo_update_json(char *out, size_t len);
+const char *closer_demo_base_url(void);                      // the lab demos site (https://closer.ram.eemcs.utwente.nl/labdemos)
 
 // ------------------------------------------------------------------ Wi-Fi settings (the /wifi page, closer_wifi_web.h)
 // Saved networks (the provisioned one first), a chosen band or access point, roaming. A change of network, band or

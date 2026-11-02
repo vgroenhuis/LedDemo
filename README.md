@@ -44,6 +44,10 @@ Roll back by publishing an older build. `unpublish turtle` stops offering update
   Next step: signed app images (CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT) with the key kept off the web path.
 * Remote testing of a release before it goes out (run it on a spare board, or a simulator, and publish when it passes).
 
+## Fast start-up (since 1.16.0)
+The channel of the last connection is saved (only when it changes); after a restart the first attempt joins on that
+channel alone (well under a second), and only if that fails it searches all channels (~20 s with Bluetooth on).
+
 ## Roaming (components/closer_demo, settings under "CloSer demo reporting" in menuconfig)
 The chip joins one access point and stays; with many access points sharing one network name (iotroam) that may
 be a poor one. The firmware looks around (a scan for the same SSID) and moves only to an access point that is at
@@ -52,9 +56,13 @@ least `CLOSER_ROAM_MARGIN` (10 dB) stronger.
 * While the signal is below `CLOSER_ROAM_RSSI` (-67 dBm): after 60 s, and if that finds nothing better, after 120, 240 ... up to
   `CLOSER_ROAM_BACKOFF_MAX_S` (600 s). Moving resets the wait.
 * Every `CLOSER_ROAM_PERIODIC_S` seconds regardless (default 0 = never).
-A scan listens `CLOSER_ROAM_SCAN_CHANNEL_MS` per channel and returns to the network's channel for `CLOSER_ROAM_SCAN_DWELL_MS`
-between channels, so traffic is delayed by tens of milliseconds at a time over a few seconds, not blocked.
-For time-critical parts call `closer_demo_roaming_hold(true)` ... `closer_demo_roaming_hold(false)`; or turn roaming off
+* Not while the network has a single access point (the last scan found only one; checked again after 30 min or on
+  another network).
+Since 1.16.0 every scan (roaming and the access point list) visits one channel at a time, 0.4 s apart (~20 s for all
+2.4 and 5 GHz channels), listening `CLOSER_ROAM_SCAN_CHANNEL_MS` per channel: traffic is delayed by at most a tenth of a
+second now and then, the board stays reachable. No scans during an update.
+For time-critical parts call `closer_demo_roaming_hold(true)` ... `closer_demo_roaming_hold(false)` (a scan under way
+stops too); or turn roaming off
 (`CLOSER_ROAMING`). The page shows `roam_scans`, `roams` and `alt_rssi` (strongest other access point at the last scan).
 
 ## LED page
