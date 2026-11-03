@@ -350,6 +350,8 @@ static const char *reason_text(int r) {
     }
 }
 
+static TaskHandle_t seek_h;      // seek_task: finds any saved network when the one in use isn't there
+
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
         wifi_event_sta_connected_t *e = data;
@@ -400,6 +402,13 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             make_config(&wc);
             esp_wifi_set_config(WIFI_IF_STA, &wc);
         }
+        // Network not found (moved elsewhere?): one scan for all saved networks, like a phone, instead of trying them
+        // one by one (6 tries of ~20 s each). Not for the quick try on the channel of a connection just lost.
+        bool quick_next = S.ever_connected && S.last_channel && S.attempts <= 2;
+        if (!S.roam_pending && !S.switching && e->reason == WIFI_REASON_NO_AP_FOUND && nets_n > 1 && !quick_next && seek_h) {
+            xTaskNotifyGive(seek_h);         // (it connects)
+            return;
+        }
         if (!S.roam_pending && !S.switching && nets_n > 1 && S.attempts % 6 == 0) {
             // The network in use can't be joined (out of range?): the next saved one, in turn.
             int i = find_net(S.ssid);
@@ -419,9 +428,8 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             // channels again (about 20 s with Bluetooth on, as it then shares the radio).
             wifi_config_t wc;
             if (esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK) {
-                bool quick = S.ever_connected && S.last_channel && S.attempts <= 2;
-                wc.sta.channel = quick ? S.last_channel : 0;
-                wc.sta.scan_method = quick ? WIFI_FAST_SCAN : WIFI_ALL_CHANNEL_SCAN;
+                wc.sta.channel = quick_next ? S.last_channel : 0;
+                wc.sta.scan_method = quick_next ? WIFI_FAST_SCAN : WIFI_ALL_CHANNEL_SCAN;
                 esp_wifi_set_config(WIFI_IF_STA, &wc);
             }
         }
@@ -667,6 +675,65 @@ static void roam_task(void *arg) {
             }
         }
         vTaskDelay(pdMS_TO_TICKS(CONFIG_CLOSER_ROAM_CHECK_S * 1000));
+    }
+}
+
+// When the network in use isn't found (the demo was taken elsewhere): all channels at once (nothing to hold up while
+// not connected) and every network name, then the network in use if it is there after all, else the strongest saved
+// one. A few seconds (~20 s with Bluetooth on), where trying the saved networks in turn took minutes. Nothing saved
+// in range: again SEEK_GAP_MS later.
+#define SEEK_GAP_MS 3000
+static void seek_task(void *arg) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        for (int round = 1; !closer_demo_wifi_connected() && !S.switching; round++) {
+            set_wifi_state(round == 1 ? "Looking for known networks" : "No known network in range");
+            uint16_t n = 32;
+            wifi_ap_record_t *recs = calloc(n, sizeof *recs);
+            if (!recs) break;
+            wifi_scan_config_t sc = {.show_hidden = false, .scan_type = WIFI_SCAN_TYPE_ACTIVE, .scan_time = scan_time()};
+            esp_err_t e = ESP_FAIL;
+            if (xSemaphoreTake(scan_lock, pdMS_TO_TICKS(30000)) == pdTRUE) {
+                e = esp_wifi_scan_start(&sc, true);
+                if (e == ESP_OK) e = esp_wifi_scan_get_ap_records(&n, recs);
+                else esp_wifi_clear_ap_list();
+                xSemaphoreGive(scan_lock);
+            }
+            int pick = -1;
+            if (e == ESP_OK) {
+                qsort(recs, n, sizeof *recs, by_rssi);
+                for (int i = 0; i < n; i++) {
+                    if (find_net((const char *)recs[i].ssid) < 0) continue;
+                    if (pick < 0) pick = i;
+                    if (strcmp((const char *)recs[i].ssid, S.ssid) == 0) { pick = i; break; }
+                }
+            }
+            if (pick >= 0 && !closer_demo_wifi_connected() && !S.switching) {
+                const wifi_ap_record_t *r = &recs[pick];
+                if (strcmp((const char *)r->ssid, S.ssid) != 0) {
+                    const saved_net_t *sn = &nets[find_net((const char *)r->ssid)];
+                    ESP_LOGW(TAG, "Saved network %s found (%d dBm, ch %d) instead of %s", sn->ssid, r->rssi, r->primary, S.ssid);
+                    strlcpy(S.ssid, sn->ssid, sizeof S.ssid);
+                    strlcpy(S.password, sn->pass, sizeof S.password);
+                    S.pin_bssid[0] = 0;
+                    S.unsaved = true;
+                }
+                wifi_config_t wc;
+                make_config(&wc);
+                wc.sta.channel = r->primary;              // (seen there just now: only that channel)
+                wc.sta.scan_method = WIFI_FAST_SCAN;
+                esp_wifi_set_config(WIFI_IF_STA, &wc);
+                S.last_channel = 0;
+                set_wifi_state("Joining %s (ch %d)", S.ssid, r->primary);
+                free(recs);
+                esp_wifi_connect();
+                break;
+            }
+            free(recs);
+            ESP_LOGW(TAG, "No saved network in range (scan %d: %s, %d seen)", round, esp_err_to_name(e), e == ESP_OK ? n : 0);
+            S.attempts++;                                 // (shown as "attempt N")
+            vTaskDelay(pdMS_TO_TICKS(SEEK_GAP_MS));
+        }
     }
 }
 
@@ -1017,6 +1084,7 @@ esp_err_t closer_demo_start(const char *hostname) {
         closer_demo_set_message(m);
     }
     ESP_LOGI(TAG, "Firmware %s%s", S.version, S.pending_verify ? " (new, unconfirmed)" : "");
+    xTaskCreate(seek_task, "wifi_seek", 4096, NULL, 4, &seek_h);
     wifi_start();
     xTaskCreate(report_task, "report", 8192, NULL, 4, &S.reporter);
     xTaskCreate(roam_task, "roam", 4096, NULL, 3, NULL);      // (does nothing while roaming is switched off)
